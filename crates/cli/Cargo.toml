@@ -1,0 +1,21 @@
+[package]
+name = "namespace-cli"
+description = "Wallet and transaction builder for the namespace chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ns"
+path = "src/main.rs"
+
+[dependencies]
+namespace-core.workspace = true
+anyhow.workspace = true
+bitcoin.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

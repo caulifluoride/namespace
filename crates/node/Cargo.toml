@@ -1,0 +1,25 @@
+[package]
+name = "namespace-node"
+description = "Namespace full node: follows the Bitcoin covenant chain, validates and serves blocks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "namespaced"
+path = "src/main.rs"
+
+[dependencies]
+namespace-core.workspace = true
+anyhow.workspace = true
+bitcoin.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = "0.8"
+iroh = "1"
+redb = "4"
