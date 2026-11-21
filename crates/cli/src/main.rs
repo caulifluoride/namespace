@@ -43,10 +43,12 @@ enum Cmd {
     /// Fetch a proof of a name's record and check it against the node's
     /// state root.
     Proof { name: Name },
-    /// Open a free name for registration a week from now. Anyone can then
-    /// register it; the first registration in a block wins.
+    /// Announce a free name. The announcement belongs to the builder whose
+    /// block includes it: only that builder's first block from a week later
+    /// can register the name.
     Announce { name: Name },
-    /// Register an announced name to this wallet's key.
+    /// Register an announced name to this wallet's key. Only the builder
+    /// that announced it can include this.
     Register { name: Name },
     /// Extend a name's expiry.
     Renew { name: Name },
@@ -319,6 +321,10 @@ impl Wallet {
             .with_context(|| {
                 format!("{name} hasn't been announced; run `ns announce {name}` first")
             })?;
+        if announcement["lapsed"].as_bool().context("bad announcement")? {
+            let released_at = announcement["released_at"].as_u64().context("bad announcement")?;
+            bail!("the announcing builder didn't register {name}; it's released at {released_at}");
+        }
         let opens_at = announcement["opens_at"].as_u64().context("bad announcement")?;
         let status = self.get("/status").await?.context("no status")?;
         let height = status["height"].as_u64().context("bad status")?;

@@ -146,9 +146,15 @@ mod tests {
         let announce = Tx::Announce {
             name: Name::new(&format!("n{tag}")).unwrap(),
         };
+        let builder = bitcoin::secp256k1::Keypair::from_seckey_slice(
+            &bitcoin::secp256k1::Secp256k1::signing_only(),
+            &[1; 32],
+        )
+        .unwrap();
         Block::new(
             parent.hash(),
             parent.header.height,
+            &builder,
             vec![announce],
             Hash256::ZERO,
         )

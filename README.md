@@ -28,6 +28,10 @@ the protocol (for example over Lightning, or with a Bitcoin payment made conditi
 inclusion). A builder can spend what it collects on its anchor's Bitcoin fee to outbid other
 builders for the next slot.
 
+**Signed blocks.** Each header names its builder's BIP340 key, and the block carries the
+builder's signature over the header hash. A block with a bad signature is invalid. The node
+keeps its builder key in `builder.key` in its data directory.
+
 **Fork choice.** Each header names its parent, so anchored blocks form a tree. A block is
 eligible when it's anchored after its parent, its body is known, it's valid, and its parent
 is eligible. The tip is the highest eligible block, with ties going to the earliest anchor.
@@ -37,13 +41,15 @@ them.
 
 **Names.**
 - *Names:* 1–63 characters of `a-z0-9-`, mapping to a BIP340 x-only owner key.
-- *Registering* takes two steps. Anyone can first *announce* a free name. Then, at least
-  `announce_delay` (336) blocks later, about a week, anyone can register it to any owner
-  key. The first registration to land in a block wins, so the name goes to whoever gets the
-  builder of that block to include theirs. Builders compete for the slot through their
-  anchors' Bitcoin fees, so that block's builder is chosen by an auction run outside the
-  chain. The delay gives everyone time to see the name coming up. Announcing doesn't reserve
-  the name for the announcer. A name that expires has to be announced again.
+- *Registering* takes two steps. First a free name is *announced* in some block, and the
+  announcement belongs to that block's builder. Then the name can be registered to any
+  owner key, but only in that builder's first block at least `announce_delay` (336) blocks,
+  about a week, after the announcement. If that block doesn't register it, the announcement
+  lapses. A lapsed or unregistered announcement is released `2 × announce_delay` blocks
+  after it was made, and then anyone can announce the name again. Users who want a name pay
+  the announcing builder for it outside the protocol. Builders compete for slots, and so for
+  the right to announce, through their anchors' Bitcoin fees. A name that expires has to be
+  announced again.
 - *Expiry:* names expire `expiry_period` (52,560) blocks, about three years, after they're
   registered or last renewed.
 - *Renew and transfer* are Schnorr-signed by the owner over `(name, registered_at, seq)`, so
@@ -54,7 +60,9 @@ them.
   about three months: 1 announcement every 9 blocks, then every 3, then 1, 3, 9 and 16 per
   block. When a tier reaches 16, the next one opens. Tier 0 starts at 3 per block. A tier
   takes about 18 months to ramp up, and 1-character names open after about 13 years.
-  Registrations have no cap of their own, since each one needs an announcement. See `Params`
+  The caps limit how many names a slot's builder can claim, which matters most while a tier
+  is opening and its best names are still free. Registrations have no cap of their own,
+  since each one needs an announcement. See `Params`
   in `crates/core/src/params.rs`.
 
 All rule heights are namespace heights, not Bitcoin heights, so a block's validity doesn't
@@ -105,8 +113,8 @@ namespaced --network regtest \
 # or: --bitcoin-backend core --bitcoin-url http://127.0.0.1:18443 --bitcoin-auth user:pass
 
 ns keygen
-ns announce alice    # anyone can register it announce_delay blocks after it's anchored
-ns register alice
+ns announce alice    # owned by the builder whose block includes it
+ns register alice    # that builder can include it announce_delay blocks later
 ns lookup alice
 ns proof alice       # record plus Merkle proof against the state root
 

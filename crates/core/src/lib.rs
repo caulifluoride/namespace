@@ -22,7 +22,7 @@ pub use encode::{Decode, Encode};
 pub use hash::Hash256;
 pub use name::Name;
 pub use params::{Params, TierRate};
-pub use state::{BlockBuilder, NameProof, NameRecord, State};
+pub use state::{Announcement, BlockBuilder, NameProof, NameRecord, State};
 pub use tx::{OwnerKey, Tx};
 
 #[cfg(test)]

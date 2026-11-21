@@ -10,7 +10,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use namespace_core::anchor::commitment_script;
 use namespace_core::encode::Decode;
-use namespace_core::{Block, BlockHash, Hash256, Name, NameProof, NameRecord, TierRate, Tx};
+use namespace_core::{
+    Announcement, Block, BlockHash, Hash256, Name, NameProof, NameRecord, TierRate, Tx,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::node::Node;
@@ -120,25 +122,30 @@ async fn proof(
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Announcement {
-    pub announced_at: u64,
-    /// The first height a registration of the name can be in.
+pub struct AnnouncementStatus {
+    #[serde(flatten)]
+    pub announcement: Announcement,
+    /// The first height a registration of the name can be in. It has to be
+    /// the announcing builder's first block from here on.
     pub opens_at: u64,
+    /// The height the announcement is dropped at if it isn't registered.
+    pub released_at: u64,
 }
 
 async fn announcement(
     State(node): AppState,
     Path(name): Path<String>,
-) -> Result<Json<Announcement>, Response> {
+) -> Result<Json<AnnouncementStatus>, Response> {
     let name = Name::new(&name).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
     let chain = node.chain();
-    let announced_at = chain
+    let announcement = *chain
         .state()
-        .announced_at(&name)
+        .announcement(&name)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "name not announced"))?;
-    Ok(Json(Announcement {
-        announced_at,
-        opens_at: announced_at + chain.params().announce_delay,
+    Ok(Json(AnnouncementStatus {
+        announcement,
+        opens_at: announcement.opens_at(chain.params()),
+        released_at: announcement.released_at(chain.params()),
     }))
 }
 

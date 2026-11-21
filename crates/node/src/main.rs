@@ -5,11 +5,14 @@ mod node;
 mod rpc;
 mod store;
 
+use std::io::Write;
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bitcoin::OutPoint;
+use bitcoin::secp256k1::{Keypair, Secp256k1};
 use clap::{Parser, ValueEnum};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -126,7 +129,9 @@ async fn run<S: BitcoinSource>(args: Args, source: S) -> Result<()> {
         .await?;
     info!(endpoint_id = %endpoint.id(), "p2p endpoint bound");
 
-    let node = Node::new(chain, store, endpoint.clone(), args.peers)?;
+    let builder = load_or_create_builder_key(&args.data_dir.join("builder.key"))?;
+    info!(builder = %builder.x_only_public_key().0, "builder key");
+    let node = Node::new(chain, builder, store, endpoint.clone(), args.peers)?;
     let router = Router::builder(endpoint)
         .accept(ALPN, Protocol(node.clone()))
         .spawn();
@@ -146,6 +151,27 @@ async fn run<S: BitcoinSource>(args: Args, source: S) -> Result<()> {
     // So the next start doesn't replay what this run applied.
     node.chain().save_snapshot(&node.store)?;
     Ok(())
+}
+
+/// The key this node signs its blocks with. Kept across restarts: names it
+/// announces can only be registered in blocks signed with the same key.
+fn load_or_create_builder_key(path: &Path) -> Result<Keypair> {
+    let secp = Secp256k1::signing_only();
+    if let Ok(hex_key) = std::fs::read_to_string(path) {
+        let sk: bitcoin::secp256k1::SecretKey = hex_key
+            .trim()
+            .parse()
+            .with_context(|| format!("parsing {}", path.display()))?;
+        return Ok(Keypair::from_secret_key(&secp, &sk));
+    }
+    let kp = Keypair::new(&secp, &mut bitcoin::secp256k1::rand::thread_rng());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(kp.secret_key().display_secret().to_string().as_bytes())?;
+    Ok(kp)
 }
 
 /// The node's p2p identity, kept across restarts so peers can find it.

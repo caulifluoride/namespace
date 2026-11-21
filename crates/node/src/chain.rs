@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result};
 use bitcoin::OutPoint;
-use bitcoin::secp256k1::{Secp256k1, VerifyOnly};
+use bitcoin::secp256k1::{Keypair, Secp256k1, VerifyOnly};
 use namespace_core::encode::Decode;
 use namespace_core::state::{AddTxError, Undo};
 use namespace_core::{
@@ -270,10 +270,11 @@ impl Chain {
         Ok(true)
     }
 
-    /// Builds a block on the tip from the mempool and keeps it as pending.
-    /// Anchoring it in Bitcoin is up to the caller.
-    pub fn build_block(&mut self) -> Block {
-        let mut builder = BlockBuilder::new(&self.state, &self.params, &self.secp);
+    /// Builds a block on the tip from the mempool, signed as `builder`, and
+    /// keeps it as pending. Anchoring it in Bitcoin is up to the caller.
+    /// Announcements in the block belong to `builder`.
+    pub fn build_block(&mut self, builder: &Keypair) -> Block {
+        let mut builder = BlockBuilder::new(&self.state, builder, &self.params, &self.secp);
         // Mempool txs were valid alone but may conflict with each other, and
         // the block may fill up. Either way the tx just stays in the mempool.
         for tx in &self.mempool {
@@ -444,13 +445,13 @@ mod tests {
         fn next_block(&self, txs: Vec<Tx>) -> Block {
             self.chain
                 .state
-                .next_block(txs, &self.chain.params, &self.chain.secp)
+                .next_block(txs, &keypair(), &self.chain.params, &self.chain.secp)
                 .unwrap()
         }
 
         /// Builds a block from the mempool, anchors it, and returns it.
         fn build_and_mine(&mut self) -> Block {
-            let block = self.chain.build_block();
+            let block = self.chain.build_block(&keypair());
             self.mine(Some(&block));
             block
         }
@@ -562,7 +563,7 @@ mod tests {
         let mut f = Fixture::new("invalid");
         let (_, register) = register_txs("alice", &keypair());
         // Registers without an announcement: anchored, but invalid.
-        let bad = Block::new(Block::genesis().hash(), 0, vec![register], Hash256::ZERO);
+        let bad = Block::new(Block::genesis().hash(), 0, &keypair(), vec![register], Hash256::ZERO);
         f.mine(Some(&bad));
         assert_eq!(f.chain.add_block(&f.store, bad).unwrap(), AddBlock::Stored);
         assert_eq!(f.chain.state().height(), 0);
@@ -594,6 +595,7 @@ mod tests {
         let stale = Block::new(
             Block::genesis().hash(),
             0,
+            &keypair(),
             vec![register_txs("alice", &keypair()).0],
             Hash256::ZERO,
         );
@@ -685,7 +687,7 @@ mod tests {
     fn invalid_blocks_are_remembered() {
         let mut f = Fixture::new("invalid-persist");
         let (_, register) = register_txs("alice", &keypair());
-        let bad = Block::new(Block::genesis().hash(), 0, vec![register], Hash256::ZERO);
+        let bad = Block::new(Block::genesis().hash(), 0, &keypair(), vec![register], Hash256::ZERO);
         f.mine(Some(&bad));
         f.chain.add_block(&f.store, bad.clone()).unwrap();
         assert_eq!(f.store.invalid_blocks().unwrap(), vec![bad.hash()]);

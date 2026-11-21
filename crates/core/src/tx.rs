@@ -94,11 +94,11 @@ impl Tx {
     }
 }
 
-fn decode_key(r: &mut Reader<'_>) -> Result<OwnerKey, DecodeError> {
+pub(crate) fn decode_key(r: &mut Reader<'_>) -> Result<OwnerKey, DecodeError> {
     XOnlyPublicKey::from_slice(r.take(32)?).map_err(|_| DecodeError::Invalid("public key"))
 }
 
-fn decode_sig(r: &mut Reader<'_>) -> Result<schnorr::Signature, DecodeError> {
+pub(crate) fn decode_sig(r: &mut Reader<'_>) -> Result<schnorr::Signature, DecodeError> {
     schnorr::Signature::from_slice(r.take(64)?).map_err(|_| DecodeError::Invalid("signature"))
 }
 

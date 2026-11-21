@@ -12,6 +12,8 @@ use crate::tx::{OwnerKey, SignedOp, Tx, sighash, sign};
 
 struct Harness {
     state: State,
+    /// Builds every block unless a test says otherwise.
+    builder: Keypair,
     params: Params,
     secp: Secp256k1<VerifyOnly>,
     undos: Vec<Undo>,
@@ -47,27 +49,44 @@ impl Harness {
     fn new() -> Self {
         Self {
             state: State::new(),
+            builder: keypair(100),
             params: Params::regtest(),
             secp: Secp256k1::verification_only(),
             undos: Vec::new(),
         }
     }
 
-    /// The next block with `txs`. If they're invalid there's no state root
-    /// to compute, so it's left zero and applying the block reports why.
-    fn block(&self, txs: Vec<Tx>) -> Block {
+    /// The next block with `txs`, built by `builder`. If they're invalid
+    /// there's no state root to compute, so it's left zero and applying the
+    /// block reports why.
+    fn block_by(&self, builder: &Keypair, txs: Vec<Tx>) -> Block {
         self.state
-            .next_block(txs.clone(), &self.params, &self.secp)
+            .next_block(txs.clone(), builder, &self.params, &self.secp)
             .unwrap_or_else(|_| {
-                Block::new(self.state.tip(), self.state.height(), txs, Hash256::ZERO)
+                Block::new(
+                    self.state.tip(),
+                    self.state.height(),
+                    builder,
+                    txs,
+                    Hash256::ZERO,
+                )
             })
     }
 
-    fn apply(&mut self, txs: Vec<Tx>) -> Result<(), BlockError> {
-        let block = self.block(txs);
+    fn block(&self, txs: Vec<Tx>) -> Block {
+        self.block_by(&self.builder, txs)
+    }
+
+    fn apply_by(&mut self, builder: &Keypair, txs: Vec<Tx>) -> Result<(), BlockError> {
+        let block = self.block_by(builder, txs);
         let undo = self.state.apply_block(&block, &self.params, &self.secp)?;
         self.undos.push(undo);
         Ok(())
+    }
+
+    fn apply(&mut self, txs: Vec<Tx>) -> Result<(), BlockError> {
+        let builder = self.builder;
+        self.apply_by(&builder, txs)
     }
 
     fn empty_blocks(&mut self, n: u64) {
@@ -121,7 +140,7 @@ fn announce_then_register() {
     let rec = h.state.lookup(&name("alice")).unwrap();
     assert_eq!(rec.owner, owner(&alice));
     assert_eq!(rec.seq, 0);
-    assert_eq!(h.state.announced_at(&name("alice")), None);
+    assert_eq!(h.state.announcement(&name("alice")), None);
 }
 
 #[test]
@@ -267,8 +286,10 @@ fn announcement_cap_enforced() {
     h.apply(announces[..3].to_vec()).unwrap();
     h.apply(announces[3..].to_vec()).unwrap();
 
-    // Registrations have no cap of their own.
-    h.empty_blocks(h.params.announce_delay - 1);
+    // Registrations have no cap of their own. Another builder's block goes
+    // by while the first three are open, so ours can register all four.
+    let other = keypair(101);
+    h.apply_by(&other, vec![]).unwrap();
     let kp = keypair(1);
     h.apply(names.iter().map(|n| register(n, &kp)).collect())
         .unwrap();
@@ -309,7 +330,7 @@ fn revert_restores_previous_state() {
 #[test]
 fn builder_skips_invalid_and_overflowing_txs() {
     let h = Harness::new();
-    let mut builder = BlockBuilder::new(&h.state, &h.params, &h.secp);
+    let mut builder = BlockBuilder::new(&h.state, &h.builder, &h.params, &h.secp);
     for n in ["a", "a", "b", "c", "d"] {
         let _ = builder.try_add(announce(n));
     }
@@ -318,8 +339,9 @@ fn builder_skips_invalid_and_overflowing_txs() {
     assert_eq!(block.txs.len(), 3);
     let mut state = h.state.clone();
     state.apply_block(&block, &h.params, &h.secp).unwrap();
-    assert!(state.announced_at(&name("c")).is_some());
-    assert!(state.announced_at(&name("d")).is_none());
+    let c = state.announcement(&name("c")).unwrap();
+    assert_eq!(c.builder, owner(&h.builder));
+    assert!(state.announcement(&name("d")).is_none());
 }
 
 #[test]
@@ -345,9 +367,14 @@ fn encoding_roundtrip() {
 #[test]
 fn wrong_state_root_rejected() {
     let mut h = Harness::new();
-    let mut block = h.block(vec![announce("alice")]);
+    let block = Block::new(
+        h.state.tip(),
+        h.state.height(),
+        &h.builder,
+        vec![announce("alice")],
+        Hash256::ZERO,
+    );
     let before = format!("{:?}", h.state);
-    block.header.state_root = Hash256::ZERO;
     assert_eq!(
         h.state.apply_block(&block, &h.params, &h.secp).unwrap_err(),
         BlockError::StateRoot
@@ -445,5 +472,68 @@ fn short_names_wait_for_their_tier() {
     assert_eq!(h.params.tier_rate(12, 2), TierRate::PerBlock { count: 1 });
     h.empty_blocks(11 - h.state.height());
     h.apply(vec![announce("bob")]).unwrap();
-    assert_eq!(h.state.announced_at(&name("bob")), Some(12));
+    assert_eq!(
+        h.state.announcement(&name("bob")).unwrap().announced_at,
+        12
+    );
+}
+
+#[test]
+fn only_the_announcing_builder_can_register() {
+    let mut h = Harness::new();
+    let (alice, other) = (keypair(1), keypair(101));
+    h.apply(vec![announce("alice")]).unwrap();
+    h.empty_blocks(h.params.announce_delay - 1);
+    let r = h.apply_by(&other, vec![register("alice", &alice)]);
+    assert_eq!(tx_error(r), TxError::WrongBuilder);
+    // Other builders' blocks don't use up the announcer's chance.
+    h.apply_by(&other, vec![]).unwrap();
+    h.apply(vec![register("alice", &alice)]).unwrap();
+    assert_eq!(h.state.lookup(&name("alice")).unwrap().owner, owner(&alice));
+}
+
+#[test]
+fn announcement_lapses_after_builders_first_block_then_is_released() {
+    let mut h = Harness::new();
+    let (alice, other) = (keypair(1), keypair(101));
+    h.apply(vec![announce("alice")]).unwrap();
+    let a = *h.state.announcement(&name("alice")).unwrap();
+    // Our blocks before the delay don't count.
+    h.empty_blocks(h.params.announce_delay - 1);
+    assert!(!h.state.announcement(&name("alice")).unwrap().lapsed);
+    // Our first block once it's open doesn't register it, so it lapses.
+    h.empty_blocks(1);
+    assert!(h.state.announcement(&name("alice")).unwrap().lapsed);
+    let r = h.apply(vec![register("alice", &alice)]);
+    assert_eq!(tx_error(r), TxError::AnnouncementLapsed);
+    // Still held until it's released, then anyone can announce it.
+    let r = h.apply_by(&other, vec![announce("alice")]);
+    assert_eq!(tx_error(r), TxError::AlreadyAnnounced);
+    h.empty_blocks(a.released_at(&h.params) - h.state.height() - 1);
+    h.apply_by(&other, vec![announce("alice")]).unwrap();
+    let again = h.state.announcement(&name("alice")).unwrap();
+    assert_eq!(again.builder, owner(&other));
+    assert!(!again.lapsed);
+}
+
+#[test]
+fn block_signature_checked() {
+    let mut h = Harness::new();
+    let mut block = h.block(vec![announce("alice")]);
+    // Claims to be built by someone else, signed by us.
+    block.header.builder = owner(&keypair(101));
+    assert_eq!(
+        h.state.apply_block(&block, &h.params, &h.secp).unwrap_err(),
+        BlockError::Signature
+    );
+}
+
+#[test]
+fn mempool_accepts_registrations_for_any_builder() {
+    let mut h = Harness::new();
+    let other = keypair(101);
+    h.apply_by(&other, vec![announce("alice")]).unwrap();
+    h.empty_blocks(h.params.announce_delay - 1);
+    let tx = register("alice", &keypair(1));
+    h.state.check_tx(&tx, &h.params, &h.secp).unwrap();
 }

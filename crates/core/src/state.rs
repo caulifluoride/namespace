@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use bitcoin::secp256k1::{Secp256k1, VerifyOnly};
+use bitcoin::secp256k1::{Keypair, Secp256k1, VerifyOnly};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -50,6 +50,55 @@ impl Decode for NameRecord {
     }
 }
 
+/// A name waiting to be registered by the builder that announced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Announcement {
+    pub announced_at: u64,
+    /// The builder of the block that announced the name. Only its blocks can
+    /// register it.
+    pub builder: OwnerKey,
+    /// The builder's first block from `announced_at + announce_delay` on went
+    /// by without registering the name, so it can't be registered anymore.
+    /// It stays until it is released.
+    pub lapsed: bool,
+}
+
+impl Announcement {
+    /// The first height a registration of the name can be in.
+    pub fn opens_at(&self, params: &Params) -> u64 {
+        self.announced_at + params.announce_delay
+    }
+
+    /// The height the announcement is dropped at, so anyone can announce the
+    /// name again.
+    pub fn released_at(&self, params: &Params) -> u64 {
+        self.announced_at + 2 * params.announce_delay
+    }
+}
+
+impl Encode for Announcement {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.announced_at);
+        out.extend_from_slice(&self.builder.serialize());
+        out.push(u8::from(self.lapsed));
+    }
+}
+
+impl Decode for Announcement {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            announced_at: r.u64()?,
+            builder: OwnerKey::from_slice(r.take(32)?)
+                .map_err(|_| DecodeError::Invalid("public key"))?,
+            lapsed: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::Invalid("lapsed flag")),
+            },
+        })
+    }
+}
+
 // Where names and announcements live in the state tree. Distinct tags keep
 // the two kinds of key apart.
 
@@ -65,8 +114,8 @@ fn announcement_key(name: &Name) -> Hash256 {
     Hash256::tagged("namespace/state-announcement", &name.to_bytes())
 }
 
-fn announcement_value(height: u64) -> Hash256 {
-    Hash256::tagged("namespace/state-announcement-height", &height.to_le_bytes())
+fn announcement_value(a: &Announcement) -> Hash256 {
+    Hash256::tagged("namespace/state-announcement-record", &a.to_bytes())
 }
 
 /// Proves a name's record (or that it has none) against a header's
@@ -105,6 +154,8 @@ pub enum BlockError {
     TxRoot,
     #[error("state root does not match the resulting state")]
     StateRoot,
+    #[error("block is not signed by its builder")]
+    Signature,
     #[error("{kind} limit exceeded: {count} > {cap}")]
     Limit {
         kind: &'static str,
@@ -127,8 +178,12 @@ pub enum TxError {
     AlreadyAnnounced,
     #[error("name has not been announced")]
     NotAnnounced,
+    #[error("name was announced by another builder")]
+    WrongBuilder,
     #[error("name can't be registered until height {0}")]
     AnnouncementTooRecent(u64),
+    #[error("the announcing builder's chance to register the name has passed")]
+    AnnouncementLapsed,
     #[error("name is already registered")]
     NameTaken,
     #[error("name is not registered or has expired")]
@@ -146,9 +201,15 @@ pub struct State {
     tip: BlockHash,
     height: u64,
     names: BTreeMap<Name, NameRecord>,
-    /// Announced names and the height they were announced at.
-    announcements: BTreeMap<Name, u64>,
-    /// Both of the above, authenticated. Its root is the header's `state_root`.
+    announcements: BTreeMap<Name, Announcement>,
+    /// `(announced_at, name)` for every announcement, for releasing them in
+    /// height order.
+    announcements_by_height: BTreeSet<(u64, Name)>,
+    /// `(announced_at, name)` for each builder's announcements that haven't
+    /// lapsed, for lapsing them when the builder's next block goes by.
+    open_by_builder: BTreeMap<OwnerKey, BTreeSet<(u64, Name)>>,
+    /// Names and announcements, authenticated. Its root is the header's
+    /// `state_root`.
     tree: Tree,
 }
 
@@ -163,8 +224,7 @@ pub struct Undo {
 #[derive(Clone, Debug)]
 enum UndoEntry {
     Name(Name, Option<NameRecord>),
-    AnnouncementAdded(Name),
-    AnnouncementRemoved(Name, u64),
+    Announcement(Name, Option<Announcement>),
 }
 
 impl Default for State {
@@ -181,6 +241,8 @@ impl State {
             height: 0,
             names: BTreeMap::new(),
             announcements: BTreeMap::new(),
+            announcements_by_height: BTreeSet::new(),
+            open_by_builder: BTreeMap::new(),
             tree: Tree::new(),
         }
     }
@@ -198,9 +260,9 @@ impl State {
         self.names.get(name).filter(|r| r.is_active(self.height))
     }
 
-    /// The height `name` was announced at, if it is waiting to be registered.
-    pub fn announced_at(&self, name: &Name) -> Option<u64> {
-        self.announcements.get(name).copied()
+    /// The announcement of `name`, if it is waiting to be registered.
+    pub fn announcement(&self, name: &Name) -> Option<&Announcement> {
+        self.announcements.get(name)
     }
 
     /// The root a block leaving this state must carry.
@@ -221,9 +283,11 @@ impl State {
     pub fn next_block(
         &self,
         txs: Vec<Tx>,
+        builder: &Keypair,
         params: &Params,
         secp: &Secp256k1<VerifyOnly>,
     ) -> Result<Block, BlockError> {
+        let key = builder.x_only_public_key().0;
         let mut next = self.clone();
         let mut undo = Undo {
             prev_tip: self.tip,
@@ -231,11 +295,19 @@ impl State {
         };
         next.height += 1;
         let height = next.height;
+        next.begin_block(height, params, &mut undo);
         for (index, tx) in txs.iter().enumerate() {
-            next.apply_tx(tx, height, params, secp, &mut undo)
+            next.apply_tx(tx, height, &key, params, secp, &mut undo)
                 .map_err(|error| BlockError::Tx { index, error })?;
         }
-        Ok(Block::new(self.tip, self.height, txs, next.state_root()))
+        next.end_block(height, &key, params, &mut undo);
+        Ok(Block::new(
+            self.tip,
+            self.height,
+            builder,
+            txs,
+            next.state_root(),
+        ))
     }
 
     /// Validates `block` against this state and applies it. On error the
@@ -263,6 +335,9 @@ impl State {
         if h.tx_root != tx_root(&block.txs) {
             return Err(BlockError::TxRoot);
         }
+        if !block.verify_sig(secp) {
+            return Err(BlockError::Signature);
+        }
         check_limits(block, params, height)?;
 
         let mut undo = Undo {
@@ -271,13 +346,15 @@ impl State {
         };
         self.tip = block.hash();
         self.height = height;
+        self.begin_block(height, params, &mut undo);
 
         for (index, tx) in block.txs.iter().enumerate() {
-            if let Err(error) = self.apply_tx(tx, height, params, secp, &mut undo) {
+            if let Err(error) = self.apply_tx(tx, height, &h.builder, params, secp, &mut undo) {
                 self.revert(undo);
                 return Err(BlockError::Tx { index, error });
             }
         }
+        self.end_block(height, &h.builder, params, &mut undo);
         if self.state_root() != h.state_root {
             self.revert(undo);
             return Err(BlockError::StateRoot);
@@ -293,8 +370,9 @@ impl State {
                 UndoEntry::Name(name, prev) => {
                     self.put_name(&name, prev);
                 }
-                UndoEntry::AnnouncementAdded(name) => self.remove_announcement(&name),
-                UndoEntry::AnnouncementRemoved(name, at) => self.insert_announcement(&name, at),
+                UndoEntry::Announcement(name, prev) => {
+                    self.put_announcement(&name, prev);
+                }
             }
         }
         self.tip = undo.prev_tip;
@@ -302,7 +380,9 @@ impl State {
     }
 
     /// Validates `tx` as if it were included in the next block, without
-    /// changing the state. Used for mempool admission.
+    /// changing the state. Used for mempool admission, where it isn't known
+    /// who will build the block: a registration is checked as if its
+    /// announcing builder were building it, so it can be relayed to them.
     pub fn check_tx(
         &mut self,
         tx: &Tx,
@@ -315,22 +395,102 @@ impl State {
         };
         let height = self.height + 1;
         self.height = height;
-        let result = self.apply_tx(tx, height, params, secp, &mut undo);
+        self.begin_block(height, params, &mut undo);
+        let builder = match tx {
+            Tx::Register { name, .. } => self.announcements.get(name).map(|a| a.builder),
+            _ => None,
+        }
+        .unwrap_or(Block::genesis().header.builder);
+        let result = self.apply_tx(tx, height, &builder, params, secp, &mut undo);
         self.revert(undo);
         result
     }
 
-    // The only places that change names and announcements, so the tree always
-    // matches them.
-
-    fn insert_announcement(&mut self, name: &Name, at: u64) {
-        self.announcements.insert(name.clone(), at);
-        self.tree.insert(announcement_key(name), announcement_value(at));
+    /// Releases announcements that are `2 * announce_delay` old, before the
+    /// block's transactions.
+    fn begin_block(&mut self, height: u64, params: &Params, undo: &mut Undo) {
+        let Some(cutoff) = height.checked_sub(2 * params.announce_delay) else {
+            return;
+        };
+        let released: Vec<_> = self
+            .announcements_by_height
+            .iter()
+            .take_while(|(at, _)| *at <= cutoff)
+            .map(|(_, name)| name.clone())
+            .collect();
+        for name in released {
+            self.set_announcement(&name, None, undo);
+        }
     }
 
-    fn remove_announcement(&mut self, name: &Name) {
-        self.announcements.remove(name);
-        self.tree.remove(&announcement_key(name));
+    /// Lapses the builder's announcements that were open in this block but
+    /// weren't registered in it, after the block's transactions.
+    fn end_block(&mut self, height: u64, builder: &OwnerKey, params: &Params, undo: &mut Undo) {
+        let Some(cutoff) = height.checked_sub(params.announce_delay) else {
+            return;
+        };
+        let Some(open) = self.open_by_builder.get(builder) else {
+            return;
+        };
+        let lapsing: Vec<_> = open
+            .iter()
+            .take_while(|(at, _)| *at <= cutoff)
+            .map(|(_, name)| name.clone())
+            .collect();
+        for name in lapsing {
+            let mut a = self.announcements[&name];
+            a.lapsed = true;
+            self.set_announcement(&name, Some(a), undo);
+        }
+    }
+
+    // The only places that change names and announcements, so the tree and
+    // the indexes always match them.
+
+    /// Sets or clears a name's announcement, returning the previous one.
+    fn put_announcement(
+        &mut self,
+        name: &Name,
+        announcement: Option<Announcement>,
+    ) -> Option<Announcement> {
+        let prev = match announcement {
+            Some(a) => {
+                self.tree
+                    .insert(announcement_key(name), announcement_value(&a));
+                self.announcements.insert(name.clone(), a)
+            }
+            None => {
+                self.tree.remove(&announcement_key(name));
+                self.announcements.remove(name)
+            }
+        };
+        if let Some(p) = prev {
+            self.announcements_by_height
+                .remove(&(p.announced_at, name.clone()));
+            if let Some(open) = self.open_by_builder.get_mut(&p.builder) {
+                open.remove(&(p.announced_at, name.clone()));
+                if open.is_empty() {
+                    self.open_by_builder.remove(&p.builder);
+                }
+            }
+        }
+        if let Some(a) = announcement {
+            self.announcements_by_height
+                .insert((a.announced_at, name.clone()));
+            if !a.lapsed {
+                self.open_by_builder
+                    .entry(a.builder)
+                    .or_default()
+                    .insert((a.announced_at, name.clone()));
+            }
+        }
+        prev
+    }
+
+    fn set_announcement(&mut self, name: &Name, a: Option<Announcement>, undo: &mut Undo) {
+        let prev = self.put_announcement(name, a);
+        undo.entries
+            .push(UndoEntry::Announcement(name.clone(), prev));
     }
 
     /// Sets or clears a name's record, returning the previous one.
@@ -356,6 +516,7 @@ impl State {
         &mut self,
         tx: &Tx,
         height: u64,
+        builder: &OwnerKey,
         params: &Params,
         secp: &Secp256k1<VerifyOnly>,
         undo: &mut Undo,
@@ -368,24 +529,31 @@ impl State {
                 if self.announcements.contains_key(name) {
                     return Err(TxError::AlreadyAnnounced);
                 }
-                self.insert_announcement(name, height);
-                undo.entries.push(UndoEntry::AnnouncementAdded(name.clone()));
+                let a = Announcement {
+                    announced_at: height,
+                    builder: *builder,
+                    lapsed: false,
+                };
+                self.set_announcement(name, Some(a), undo);
             }
             Tx::Register { name, owner } => {
                 // An announced name has no active record: announcing requires
                 // that, and registering removes the announcement.
-                let at = self
+                let a = *self
                     .announcements
                     .get(name)
-                    .copied()
                     .ok_or(TxError::NotAnnounced)?;
-                let opens_at = at + params.announce_delay;
+                if a.builder != *builder {
+                    return Err(TxError::WrongBuilder);
+                }
+                if a.lapsed {
+                    return Err(TxError::AnnouncementLapsed);
+                }
+                let opens_at = a.opens_at(params);
                 if height < opens_at {
                     return Err(TxError::AnnouncementTooRecent(opens_at));
                 }
-                self.remove_announcement(name);
-                undo.entries
-                    .push(UndoEntry::AnnouncementRemoved(name.clone(), at));
+                self.set_announcement(name, None, undo);
                 let record = NameRecord {
                     owner: *owner,
                     registered_at: height,
@@ -450,6 +618,8 @@ impl State {
 /// that are valid in sequence and fit the block's limits.
 pub struct BlockBuilder<'a> {
     state: State,
+    builder: &'a Keypair,
+    key: OwnerKey,
     params: &'a Params,
     secp: &'a Secp256k1<VerifyOnly>,
     undo: Undo,
@@ -467,15 +637,24 @@ pub enum AddTxError {
 }
 
 impl<'a> BlockBuilder<'a> {
-    pub fn new(state: &State, params: &'a Params, secp: &'a Secp256k1<VerifyOnly>) -> Self {
+    pub fn new(
+        state: &State,
+        builder: &'a Keypair,
+        params: &'a Params,
+        secp: &'a Secp256k1<VerifyOnly>,
+    ) -> Self {
         let mut state = state.clone();
-        let undo = Undo {
+        let mut undo = Undo {
             prev_tip: state.tip,
             entries: Vec::new(),
         };
         state.height += 1;
+        let height = state.height;
+        state.begin_block(height, params, &mut undo);
         Self {
             state,
+            builder,
+            key: builder.x_only_public_key().0,
             params,
             secp,
             undo,
@@ -495,8 +674,14 @@ impl<'a> BlockBuilder<'a> {
         if full {
             return Err(AddTxError::Full);
         }
-        self.state
-            .apply_tx(&tx, height, self.params, self.secp, &mut self.undo)?;
+        self.state.apply_tx(
+            &tx,
+            height,
+            &self.key,
+            self.params,
+            self.secp,
+            &mut self.undo,
+        )?;
         if announce {
             *self.announcements.entry(tier).or_default() += 1;
         }
@@ -504,9 +689,12 @@ impl<'a> BlockBuilder<'a> {
         Ok(())
     }
 
-    pub fn finish(self) -> Block {
+    pub fn finish(mut self) -> Block {
+        let height = self.state.height;
+        self.state
+            .end_block(height, &self.key, self.params, &mut self.undo);
         let root = self.state.state_root();
-        Block::new(self.undo.prev_tip, self.state.height - 1, self.txs, root)
+        Block::new(self.undo.prev_tip, height - 1, self.builder, self.txs, root)
     }
 }
 
@@ -529,9 +717,9 @@ impl Encode for State {
             out,
             u32::try_from(self.announcements.len()).expect("announcement count fits in u32"),
         );
-        for (name, at) in &self.announcements {
+        for (name, a) in &self.announcements {
             name.encode(out);
-            put_u64(out, *at);
+            a.encode(out);
         }
     }
 }
@@ -552,11 +740,10 @@ impl Decode for State {
         }
         for _ in 0..r.u32()? {
             let name = Name::decode(r)?;
-            let at = r.u64()?;
-            if state.announcements.contains_key(&name) {
+            let a = Announcement::decode(r)?;
+            if state.put_announcement(&name, Some(a)).is_some() {
                 return Err(DecodeError::Invalid("duplicate announcement"));
             }
-            state.insert_announcement(&name, at);
         }
         Ok(state)
     }

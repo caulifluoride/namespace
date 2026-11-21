@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use bitcoin::secp256k1::Keypair;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointId};
@@ -42,6 +43,8 @@ const MAX_FAILURES: u32 = 5;
 
 pub struct Node {
     pub chain: Mutex<Chain>,
+    /// Signs the blocks this node builds. Names it announces belong to it.
+    builder: Keypair,
     pub store: Store,
     pub endpoint: Endpoint,
     peers: Mutex<Peers>,
@@ -101,6 +104,7 @@ impl Node {
     /// `bootstrap` are the peers from `--peer`; stored peers are added to them.
     pub fn new(
         chain: Chain,
+        builder: Keypair,
         store: Store,
         endpoint: Endpoint,
         bootstrap: Vec<EndpointId>,
@@ -122,6 +126,7 @@ impl Node {
         info!(peers = peers.known.len(), "known peers");
         Ok(Arc::new(Self {
             chain: Mutex::new(chain),
+            builder,
             store,
             endpoint,
             peers: Mutex::new(peers),
@@ -200,7 +205,7 @@ impl Node {
     /// Builds a block from the mempool and sends it to peers ahead of its
     /// anchor, so they can follow the chain as soon as the anchor confirms.
     pub fn build_block(self: &Arc<Self>) -> Block {
-        let block = self.chain().build_block();
+        let block = self.chain().build_block(&self.builder);
         self.broadcast(Request::PushBlock(block.clone()), None);
         block
     }
