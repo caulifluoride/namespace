@@ -9,7 +9,8 @@ use bitcoin::secp256k1::{Secp256k1, VerifyOnly};
 use namespace_core::encode::Decode;
 use namespace_core::state::{AddTxError, Undo};
 use namespace_core::{
-    Block, BlockBuilder, BlockHash, ChainIndex, CovenantConfig, Hash256, Params, State, Tx,
+    Block, BlockBuilder, BlockHash, ChainIndex, CovenantConfig, Hash256, Params, State, TierRate,
+    Tx,
 };
 use tracing::{info, warn};
 
@@ -249,6 +250,17 @@ impl Chain {
         }
         if self.mempool.len() >= MAX_MEMPOOL_TXS {
             return Err("mempool is full".into());
+        }
+        if let Tx::Register { name, .. } = &tx {
+            let tier = self.params.tier(name.as_str().len());
+            if let TierRate::Closed { opens_at } =
+                self.params.tier_rate(self.state.height() + 1, tier)
+            {
+                return Err(format!(
+                    "{}-character names can't be registered until height {opens_at}",
+                    self.params.tier_lengths(tier)
+                ));
+            }
         }
         self.state
             .check_tx(&tx, &self.params, &self.secp)

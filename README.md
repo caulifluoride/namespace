@@ -32,8 +32,11 @@ them.
 - *Expiry:* names expire `expiry_period` blocks after they're registered or last renewed.
 - *Renew and transfer* are Schnorr-signed by the owner over `(name, registered_at, seq)`, so
   a signature can't be replayed, even across re-registrations.
-- *Registration cap:* starts at 16 per block and doubles every `registration_doubling_interval`
-  blocks up to 4096. Commits are capped at 4× that. See `Params` in `crates/core/src/params.rs`.
+- *Registration tiers:* shorter names open later. Names of `long_name_len` (10) characters or
+  more are tier 0, and each character shorter is the next tier. Every tier ramps up the same way,
+  one stage every `stage_length` blocks: 1 registration every 9 blocks, then every 3, then 1, 3,
+  9 and 16 per block. When a tier reaches 16, the next one opens. Tier 0 starts at 3 per block.
+  Commits are capped at 4× the total. See `Params` in `crates/core/src/params.rs`.
 
 All rule heights are namespace heights, not Bitcoin heights, so a block's validity doesn't
 depend on where its anchor lands.

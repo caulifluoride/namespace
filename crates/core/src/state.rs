@@ -111,6 +111,12 @@ pub enum BlockError {
         count: u32,
         cap: u32,
     },
+    #[error("too many registrations of {lengths}-character names: {count} > {cap}")]
+    TierLimit {
+        lengths: String,
+        count: u32,
+        cap: u32,
+    },
     #[error("tx {index}: {error}")]
     Tx { index: usize, error: TxError },
 }
@@ -469,7 +475,8 @@ pub struct BlockBuilder<'a> {
     secp: &'a Secp256k1<VerifyOnly>,
     undo: Undo,
     txs: Vec<Tx>,
-    registrations: u32,
+    /// Registrations so far, by tier.
+    registrations: BTreeMap<u32, u32>,
     commits: u32,
 }
 
@@ -497,17 +504,20 @@ impl<'a> BlockBuilder<'a> {
             secp,
             undo,
             txs: Vec::new(),
-            registrations: 0,
+            registrations: BTreeMap::new(),
             commits: 0,
         }
     }
 
     pub fn try_add(&mut self, tx: Tx) -> Result<(), AddTxError> {
         let height = self.state.height;
-        let full = match tx {
+        let tier = tx.name().map(|n| self.params.tier(n.as_str().len()));
+        let full = match (&tx, tier) {
             _ if self.txs.len() as u32 >= self.params.max_txs_per_block => true,
-            Tx::Register { .. } => self.registrations >= self.params.registration_cap(height),
-            Tx::Commit { .. } => self.commits >= self.params.commit_cap(height),
+            (Tx::Register { .. }, Some(t)) => {
+                self.registrations.get(&t).copied().unwrap_or(0) >= self.params.tier_cap(height, t)
+            }
+            (Tx::Commit { .. }, _) => self.commits >= self.params.commit_cap(height),
             _ => false,
         };
         if full {
@@ -515,9 +525,9 @@ impl<'a> BlockBuilder<'a> {
         }
         self.state
             .apply_tx(&tx, height, self.params, self.secp, &mut self.undo)?;
-        match tx {
-            Tx::Register { .. } => self.registrations += 1,
-            Tx::Commit { .. } => self.commits += 1,
+        match (&tx, tier) {
+            (Tx::Register { .. }, Some(t)) => *self.registrations.entry(t).or_default() += 1,
+            (Tx::Commit { .. }, _) => self.commits += 1,
             _ => {}
         }
         self.txs.push(tx);
@@ -591,11 +601,6 @@ fn check_limits(block: &Block, params: &Params, height: u64) -> Result<(), Block
             params.max_txs_per_block,
         ),
         (
-            "registration",
-            count(|t| matches!(t, Tx::Register { .. })),
-            params.registration_cap(height),
-        ),
-        (
             "commit",
             count(|t| matches!(t, Tx::Commit { .. })),
             params.commit_cap(height),
@@ -604,6 +609,22 @@ fn check_limits(block: &Block, params: &Params, height: u64) -> Result<(), Block
     for (kind, count, cap) in checks {
         if count > cap {
             return Err(BlockError::Limit { kind, count, cap });
+        }
+    }
+    let mut by_tier = BTreeMap::<u32, u32>::new();
+    for tx in &block.txs {
+        if let Tx::Register { name, .. } = tx {
+            *by_tier.entry(params.tier(name.as_str().len())).or_default() += 1;
+        }
+    }
+    for (tier, count) in by_tier {
+        let cap = params.tier_cap(height, tier);
+        if count > cap {
+            return Err(BlockError::TierLimit {
+                lengths: params.tier_lengths(tier),
+                count,
+                cap,
+            });
         }
     }
     Ok(())

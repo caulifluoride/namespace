@@ -21,7 +21,7 @@ pub use chain::ChainIndex;
 pub use encode::{Decode, Encode};
 pub use hash::Hash256;
 pub use name::Name;
-pub use params::Params;
+pub use params::{Params, TierRate};
 pub use state::{BlockBuilder, NameProof, NameRecord, State};
 pub use tx::{OwnerKey, Tx};
 

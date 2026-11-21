@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use namespace_core::anchor::commitment_script;
 use namespace_core::encode::Decode;
-use namespace_core::{Block, BlockHash, Hash256, Name, NameProof, NameRecord, Tx};
+use namespace_core::{Block, BlockHash, Hash256, Name, NameProof, NameRecord, TierRate, Tx};
 use serde::{Deserialize, Serialize};
 
 use crate::node::Node;
@@ -44,7 +44,16 @@ pub struct Status {
     pub missing_bodies: usize,
     pub endpoint_id: String,
     pub peers: usize,
-    pub registration_cap: u32,
+    /// What each name length can register in the next block.
+    pub registrations: Vec<TierStatus>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TierStatus {
+    /// Name lengths in this tier, e.g. `"10+"` or `"3"`.
+    pub lengths: String,
+    #[serde(flatten)]
+    pub rate: TierRate,
 }
 
 async fn status(State(node): AppState) -> Json<Status> {
@@ -60,7 +69,12 @@ async fn status(State(node): AppState) -> Json<Status> {
         missing_bodies: chain.missing_bodies().len(),
         endpoint_id: node.endpoint.id().to_string(),
         peers: node.peer_count(),
-        registration_cap: chain.params().registration_cap(state.height() + 1),
+        registrations: (0..chain.params().tiers())
+            .map(|t| TierStatus {
+                lengths: chain.params().tier_lengths(t),
+                rate: chain.params().tier_rate(state.height() + 1, t),
+            })
+            .collect(),
     })
 }
 

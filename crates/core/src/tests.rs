@@ -6,7 +6,7 @@ use crate::block::Block;
 use crate::encode::{Decode, Encode};
 use crate::hash::Hash256;
 use crate::name::Name;
-use crate::params::Params;
+use crate::params::{Params, TierRate};
 use crate::state::{BlockBuilder, BlockError, NameProof, State, TxError, Undo};
 use crate::tx::{OwnerKey, SignedOp, Tx, commitment_hash, sighash, sign};
 
@@ -267,7 +267,7 @@ fn registration_cap_enforced() {
     let mut h = Harness::new();
     let kp = keypair(1);
     let salt = Hash256([7; 32]);
-    let names = ["a", "b", "c"];
+    let names = ["a", "b", "c", "d"];
     let commits = names
         .iter()
         .map(|n| Tx::Commit {
@@ -283,16 +283,16 @@ fn registration_cap_enforced() {
             salt,
         })
         .collect();
-    // Height 2 allows 2 registrations.
+    // Regtest has one tier, at 3 per block in the first stage.
     assert_eq!(
         h.apply(regs.clone()),
-        Err(BlockError::Limit {
-            kind: "registration",
-            count: 3,
-            cap: 2
+        Err(BlockError::TierLimit {
+            lengths: "1+".into(),
+            count: 4,
+            cap: 3
         })
     );
-    h.apply(regs[..2].to_vec()).unwrap();
+    h.apply(regs[..3].to_vec()).unwrap();
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn builder_skips_invalid_and_overflowing_txs() {
     let mut h = Harness::new();
     let kp = keypair(1);
     let salt = Hash256([7; 32]);
-    let commits: Vec<_> = ["a", "b", "c"]
+    let commits: Vec<_> = ["a", "b", "c", "d"]
         .iter()
         .map(|n| Tx::Commit {
             commitment: commitment_hash(&name(n), &owner(&kp), &salt),
@@ -341,7 +341,7 @@ fn builder_skips_invalid_and_overflowing_txs() {
     h.apply(commits).unwrap();
 
     let mut builder = BlockBuilder::new(&h.state, &h.params, &h.secp);
-    for n in ["a", "a", "b", "c"] {
+    for n in ["a", "a", "b", "c", "d"] {
         let _ = builder.try_add(Tx::Register {
             name: name(n),
             owner: owner(&kp),
@@ -349,12 +349,11 @@ fn builder_skips_invalid_and_overflowing_txs() {
         });
     }
     let block = builder.finish();
-    // The second "a" has no commitment left; "c" exceeds the cap of 2.
-    assert_eq!(block.txs.len(), 2);
+    // The second "a" has no commitment left; "d" exceeds the cap of 3.
+    assert_eq!(block.txs.len(), 3);
     h.state.apply_block(&block, &h.params, &h.secp).unwrap();
-    assert!(h.state.lookup(&name("a")).is_some());
-    assert!(h.state.lookup(&name("b")).is_some());
-    assert!(h.state.lookup(&name("c")).is_none());
+    assert!(h.state.lookup(&name("c")).is_some());
+    assert!(h.state.lookup(&name("d")).is_none());
 }
 
 #[test]
@@ -463,5 +462,43 @@ fn snapshot_roundtrip() {
     // It carries on like the original.
     h.state = restored;
     h.register("bob", &keypair(2));
+    assert!(h.state.lookup(&name("bob")).is_some());
+}
+
+#[test]
+fn short_names_wait_for_their_tier() {
+    let mut h = Harness::new();
+    // Tier 0 is 5+ characters; "bob" is tier 2, which opens at height 10.
+    h.params = Params {
+        long_name_len: 5,
+        stage_length: 1,
+        ..Params::regtest()
+    };
+    assert_eq!(h.params.tier_opens_at(2), 10);
+    let kp = keypair(1);
+    h.register("alice", &kp);
+
+    let salt = Hash256([7; 32]);
+    let commitment = commitment_hash(&name("bob"), &owner(&kp), &salt);
+    h.apply(vec![Tx::Commit { commitment }]).unwrap();
+    let reg = Tx::Register {
+        name: name("bob"),
+        owner: owner(&kp),
+        salt,
+    };
+    assert_eq!(
+        h.apply(vec![reg.clone()]),
+        Err(BlockError::TierLimit {
+            lengths: "3".into(),
+            count: 1,
+            cap: 0
+        })
+    );
+
+    // It opens at one every 9 blocks, then every 3, then one per block.
+    assert_eq!(h.params.tier_rate(10, 2), TierRate::Every { blocks: 9 });
+    assert_eq!(h.params.tier_rate(12, 2), TierRate::PerBlock { count: 1 });
+    h.empty_blocks(11 - h.state.height());
+    h.apply(vec![reg]).unwrap();
     assert!(h.state.lookup(&name("bob")).is_some());
 }
