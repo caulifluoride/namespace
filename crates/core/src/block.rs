@@ -15,13 +15,16 @@ pub const BLOCK_VERSION: u32 = 1;
 pub const MAX_BLOCK_BYTES: usize = 1 << 20;
 
 /// What gets hashed and anchored in Bitcoin. Commits to its parent (forming
-/// the chain) and to its transactions through `tx_root`.
+/// the chain), to its transactions through `tx_root`, and to the state after
+/// applying them through `state_root`, so a light client holding a header can
+/// check proofs about names (see [`crate::state::NameProof`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub version: u32,
     pub parent: BlockHash,
     pub height: u64,
     pub tx_root: Hash256,
+    pub state_root: Hash256,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,13 +41,15 @@ impl BlockHeader {
 
 impl Block {
     /// Builds a block on top of `parent` (at `parent_height`) with the given
-    /// transactions, filling in the header.
-    pub fn new(parent: BlockHash, parent_height: u64, txs: Vec<Tx>) -> Self {
+    /// transactions, filling in the header. `state_root` is the state after
+    /// applying them; [`crate::State::next_block`] works it out.
+    pub fn new(parent: BlockHash, parent_height: u64, txs: Vec<Tx>, state_root: Hash256) -> Self {
         let header = BlockHeader {
             version: BLOCK_VERSION,
             parent,
             height: parent_height + 1,
             tx_root: tx_root(&txs),
+            state_root,
         };
         Self { header, txs }
     }
@@ -62,6 +67,7 @@ impl Block {
                 parent: Hash256::ZERO,
                 height: 0,
                 tx_root: tx_root(&[]),
+                state_root: crate::tree::empty_root(),
             },
             txs: Vec::new(),
         });
@@ -80,6 +86,7 @@ impl Encode for BlockHeader {
         self.parent.encode(out);
         put_u64(out, self.height);
         self.tx_root.encode(out);
+        self.state_root.encode(out);
     }
 }
 
@@ -90,6 +97,7 @@ impl Decode for BlockHeader {
             parent: Hash256::decode(r)?,
             height: r.u64()?,
             tx_root: Hash256::decode(r)?,
+            state_root: Hash256::decode(r)?,
         })
     }
 }

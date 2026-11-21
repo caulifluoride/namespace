@@ -7,7 +7,7 @@ use crate::encode::{Decode, Encode};
 use crate::hash::Hash256;
 use crate::name::Name;
 use crate::params::Params;
-use crate::state::{BlockBuilder, BlockError, State, TxError, Undo};
+use crate::state::{BlockBuilder, BlockError, NameProof, State, TxError, Undo};
 use crate::tx::{OwnerKey, SignedOp, Tx, commitment_hash, sighash, sign};
 
 struct Harness {
@@ -42,8 +42,14 @@ impl Harness {
         }
     }
 
+    /// The next block with `txs`. If they're invalid there's no state root
+    /// to compute, so it's left zero and applying the block reports why.
     fn block(&self, txs: Vec<Tx>) -> Block {
-        Block::new(self.state.tip(), self.state.height(), txs)
+        self.state
+            .next_block(txs.clone(), &self.params, &self.secp)
+            .unwrap_or_else(|_| {
+                Block::new(self.state.tip(), self.state.height(), txs, Hash256::ZERO)
+            })
     }
 
     fn apply(&mut self, txs: Vec<Tx>) -> Result<(), BlockError> {
@@ -375,4 +381,87 @@ fn encoding_roundtrip() {
     trailing.push(0);
     assert!(Block::from_bytes(&trailing).is_err());
     assert!(Block::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+}
+
+#[test]
+fn wrong_state_root_rejected() {
+    let mut h = Harness::new();
+    let mut block = h.block(vec![Tx::Commit {
+        commitment: Hash256([1; 32]),
+    }]);
+    let before = format!("{:?}", h.state);
+    block.header.state_root = Hash256::ZERO;
+    assert_eq!(
+        h.state.apply_block(&block, &h.params, &h.secp).unwrap_err(),
+        BlockError::StateRoot
+    );
+    assert_eq!(format!("{:?}", h.state), before);
+}
+
+#[test]
+fn state_root_follows_reverts() {
+    let mut h = Harness::new();
+    let (alice, bob) = (keypair(1), keypair(2));
+    h.register("alice", &alice);
+    let root = h.state.state_root();
+    let applied = h.undos.len();
+    let tx = h.transfer_tx("alice", &alice, owner(&bob));
+    h.apply(vec![tx]).unwrap();
+    assert_ne!(h.state.state_root(), root);
+    for undo in h.undos.drain(applied..).rev() {
+        h.state.revert(undo);
+    }
+    assert_eq!(h.state.state_root(), root);
+}
+
+#[test]
+fn name_proofs() {
+    let mut h = Harness::new();
+    let alice = keypair(1);
+    h.register("alice", &alice);
+    h.apply(vec![Tx::Commit {
+        commitment: Hash256([1; 32]),
+    }])
+    .unwrap();
+    let root = h.state.state_root();
+
+    let proof = h.state.prove_name(&name("alice"));
+    let rec = proof.verify(&name("alice"), &root).unwrap().unwrap();
+    assert_eq!(rec.owner, owner(&alice));
+    // The same proof says nothing about another name.
+    assert!(proof.verify(&name("bob"), &root).is_err());
+
+    let absent = h.state.prove_name(&name("bob"));
+    assert_eq!(absent.verify(&name("bob"), &root), Ok(None));
+
+    // Claiming a different record, or no record, fails.
+    let mut forged = proof.clone();
+    forged.record.as_mut().unwrap().owner = owner(&keypair(2));
+    assert!(forged.verify(&name("alice"), &root).is_err());
+    let hidden = NameProof {
+        record: None,
+        ..proof
+    };
+    assert!(hidden.verify(&name("alice"), &root).is_err());
+}
+
+#[test]
+fn snapshot_roundtrip() {
+    let mut h = Harness::new();
+    let alice = keypair(1);
+    h.register("alice", &alice);
+    h.apply(vec![Tx::Commit {
+        commitment: Hash256([1; 32]),
+    }])
+    .unwrap();
+    let bytes = h.state.to_bytes();
+    let restored = State::from_bytes(&bytes).unwrap();
+    assert_eq!(format!("{restored:?}"), format!("{:?}", h.state));
+    assert_eq!(restored.state_root(), h.state.state_root());
+    assert_eq!(restored.tip(), h.state.tip());
+
+    // It carries on like the original.
+    h.state = restored;
+    h.register("bob", &keypair(2));
+    assert!(h.state.lookup(&name("bob")).is_some());
 }

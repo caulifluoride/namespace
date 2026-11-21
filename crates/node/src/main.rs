@@ -18,7 +18,7 @@ use namespace_core::{CovenantConfig, Params};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::bitcoin_source::{BitcoinCore, BitcoinSource, Esplora, Libbitcoin};
+use crate::bitcoin_source::{BitcoinCore, BitcoinSource, Esplora};
 use crate::chain::Chain;
 use crate::node::{ALPN, Node, Protocol};
 use crate::store::Store;
@@ -30,7 +30,8 @@ struct Args {
     data_dir: PathBuf,
     #[arg(long, default_value = "127.0.0.1:7340")]
     rpc_addr: SocketAddr,
-    /// Endpoint ids of peers to connect to. Can be repeated.
+    /// Endpoint ids of peers to connect to. Can be repeated. More peers are
+    /// found through these, and remembered across restarts.
     #[arg(long = "peer")]
     peers: Vec<EndpointId>,
     #[arg(long, value_enum, default_value_t = Network::Mainnet)]
@@ -67,7 +68,6 @@ enum Network {
 enum Backend {
     Core,
     Esplora,
-    Libbitcoin,
 }
 
 #[tokio::main]
@@ -92,10 +92,9 @@ async fn main() -> Result<()> {
                     anyhow::Ok((u.to_owned(), p.to_owned()))
                 })
                 .transpose()?;
-            run(args, BitcoinCore { url, auth }).await
+            run(args, BitcoinCore::new(url, auth)?).await
         }
-        Backend::Esplora => run(args, Esplora { url }).await,
-        Backend::Libbitcoin => run(args, Libbitcoin { url }).await,
+        Backend::Esplora => run(args, Esplora::new(url)?).await,
     }
 }
 
@@ -127,22 +126,25 @@ async fn run<S: BitcoinSource>(args: Args, source: S) -> Result<()> {
         .await?;
     info!(endpoint_id = %endpoint.id(), "p2p endpoint bound");
 
-    let node = Node::new(chain, store, endpoint.clone(), args.peers);
+    let node = Node::new(chain, store, endpoint.clone(), args.peers)?;
     let router = Router::builder(endpoint)
         .accept(ALPN, Protocol(node.clone()))
         .spawn();
 
     tokio::spawn(follower::run(node.clone(), source));
+    tokio::spawn(node.clone().run_discovery());
 
     let listener = tokio::net::TcpListener::bind(args.rpc_addr).await?;
     info!(addr = %args.rpc_addr, "rpc listening");
-    let server = axum::serve(listener, rpc::router(node));
+    let server = axum::serve(listener, rpc::router(node.clone()));
 
     tokio::select! {
         r = server => r?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
     router.shutdown().await?;
+    // So the next start doesn't replay what this run applied.
+    node.chain().save_snapshot(&node.store)?;
     Ok(())
 }
 

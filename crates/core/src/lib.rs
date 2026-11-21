@@ -12,6 +12,7 @@ pub mod hash;
 pub mod name;
 pub mod params;
 pub mod state;
+pub mod tree;
 pub mod tx;
 
 pub use anchor::{Anchor, CovenantConfig};
@@ -21,7 +22,7 @@ pub use encode::{Decode, Encode};
 pub use hash::Hash256;
 pub use name::Name;
 pub use params::Params;
-pub use state::{BlockBuilder, NameRecord, State};
+pub use state::{BlockBuilder, NameProof, NameRecord, State};
 pub use tx::{OwnerKey, Tx};
 
 #[cfg(test)]

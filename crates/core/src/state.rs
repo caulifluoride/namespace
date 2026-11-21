@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::block::{Block, BlockHash, tx_root};
+use crate::encode::{Decode, DecodeError, Encode, Reader, put_u32, put_u64};
 use crate::hash::Hash256;
 use crate::name::Name;
 use crate::params::Params;
+use crate::tree::{InvalidProof, Proof, Tree};
 use crate::tx::{OwnerKey, SignedOp, Tx, commitment_hash, sighash, verify};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +29,70 @@ impl NameRecord {
     }
 }
 
+impl Encode for NameRecord {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.owner.serialize());
+        put_u64(out, self.registered_at);
+        put_u64(out, self.expires_at);
+        put_u64(out, self.seq);
+    }
+}
+
+impl Decode for NameRecord {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            owner: OwnerKey::from_slice(r.take(32)?)
+                .map_err(|_| DecodeError::Invalid("public key"))?,
+            registered_at: r.u64()?,
+            expires_at: r.u64()?,
+            seq: r.u64()?,
+        })
+    }
+}
+
+// Where names and commitments live in the state tree. Distinct tags keep the
+// two kinds of key apart.
+
+fn name_key(name: &Name) -> Hash256 {
+    Hash256::tagged("namespace/state-name", &name.to_bytes())
+}
+
+fn name_value(record: &NameRecord) -> Hash256 {
+    Hash256::tagged("namespace/state-name-record", &record.to_bytes())
+}
+
+fn commitment_key(commitment: &Hash256) -> Hash256 {
+    Hash256::tagged("namespace/state-commitment", &commitment.0)
+}
+
+fn commitment_value(height: u64) -> Hash256 {
+    Hash256::tagged("namespace/state-commitment-height", &height.to_le_bytes())
+}
+
+/// Proves a name's record (or that it has none) against a header's
+/// `state_root`. The record may have expired: compare `expires_at` against
+/// the header's height.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameProof {
+    pub record: Option<NameRecord>,
+    pub proof: Proof,
+}
+
+impl NameProof {
+    /// Checks the proof and returns the proven record.
+    pub fn verify(
+        &self,
+        name: &Name,
+        state_root: &Hash256,
+    ) -> Result<Option<NameRecord>, InvalidProof> {
+        let proven = self.proof.verify(state_root, &name_key(name))?;
+        if proven != self.record.as_ref().map(name_value) {
+            return Err(InvalidProof);
+        }
+        Ok(self.record)
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BlockError {
     #[error("block does not extend the current tip")]
@@ -37,6 +103,8 @@ pub enum BlockError {
     Version(u32),
     #[error("tx root does not match transactions")]
     TxRoot,
+    #[error("state root does not match the resulting state")]
+    StateRoot,
     #[error("{kind} limit exceeded: {count} > {cap}")]
     Limit {
         kind: &'static str,
@@ -75,6 +143,8 @@ pub struct State {
     commitments: HashMap<Hash256, u64>,
     /// `(height, commitment)` for pruning commitments in height order.
     commitments_by_height: BTreeSet<(u64, Hash256)>,
+    /// Both of the above, authenticated. Its root is the header's `state_root`.
+    tree: Tree,
 }
 
 /// What `State::apply_block` changed, so it can be reverted on a reorg.
@@ -107,6 +177,7 @@ impl State {
             names: BTreeMap::new(),
             commitments: HashMap::new(),
             commitments_by_height: BTreeSet::new(),
+            tree: Tree::new(),
         }
     }
 
@@ -125,6 +196,42 @@ impl State {
 
     pub fn commitment_height(&self, commitment: &Hash256) -> Option<u64> {
         self.commitments.get(commitment).copied()
+    }
+
+    /// The root a block leaving this state must carry.
+    pub fn state_root(&self) -> Hash256 {
+        self.tree.root()
+    }
+
+    pub fn prove_name(&self, name: &Name) -> NameProof {
+        NameProof {
+            record: self.names.get(name).copied(),
+            proof: self.tree.prove(&name_key(name)),
+        }
+    }
+
+    /// Builds the block on the tip that contains exactly `txs`, filling in
+    /// its state root. Fails if any of them is invalid. Unlike
+    /// [`BlockBuilder`] this doesn't check the block's limits.
+    pub fn next_block(
+        &self,
+        txs: Vec<Tx>,
+        params: &Params,
+        secp: &Secp256k1<VerifyOnly>,
+    ) -> Result<Block, BlockError> {
+        let mut next = self.clone();
+        let mut undo = Undo {
+            prev_tip: self.tip,
+            entries: Vec::new(),
+        };
+        next.height += 1;
+        let height = next.height;
+        next.prune_commitments(height, params, &mut undo);
+        for (index, tx) in txs.iter().enumerate() {
+            next.apply_tx(tx, height, params, secp, &mut undo)
+                .map_err(|error| BlockError::Tx { index, error })?;
+        }
+        Ok(Block::new(self.tip, self.height, txs, next.state_root()))
     }
 
     /// Validates `block` against this state and applies it. On error the
@@ -168,6 +275,10 @@ impl State {
                 return Err(BlockError::Tx { index, error });
             }
         }
+        if self.state_root() != h.state_root {
+            self.revert(undo);
+            return Err(BlockError::StateRoot);
+        }
         Ok(undo)
     }
 
@@ -176,20 +287,11 @@ impl State {
     pub fn revert(&mut self, undo: Undo) {
         for entry in undo.entries.into_iter().rev() {
             match entry {
-                UndoEntry::Name(name, Some(record)) => {
-                    self.names.insert(name, record);
+                UndoEntry::Name(name, prev) => {
+                    self.put_name(&name, prev);
                 }
-                UndoEntry::Name(name, None) => {
-                    self.names.remove(&name);
-                }
-                UndoEntry::CommitmentAdded(c, at) => {
-                    self.commitments.remove(&c);
-                    self.commitments_by_height.remove(&(at, c));
-                }
-                UndoEntry::CommitmentRemoved(c, at) => {
-                    self.commitments.insert(c, at);
-                    self.commitments_by_height.insert((at, c));
-                }
+                UndoEntry::CommitmentAdded(c, at) => self.remove_commitment(c, at),
+                UndoEntry::CommitmentRemoved(c, at) => self.insert_commitment(c, at),
             }
         }
         self.tip = undo.prev_tip;
@@ -227,14 +329,42 @@ impl State {
             .copied()
             .collect();
         for (at, c) in expired {
-            self.commitments_by_height.remove(&(at, c));
-            self.commitments.remove(&c);
+            self.remove_commitment(c, at);
             undo.entries.push(UndoEntry::CommitmentRemoved(c, at));
         }
     }
 
+    // The only places that change names and commitments, so the tree always
+    // matches them.
+
+    fn insert_commitment(&mut self, c: Hash256, at: u64) {
+        self.commitments.insert(c, at);
+        self.commitments_by_height.insert((at, c));
+        self.tree.insert(commitment_key(&c), commitment_value(at));
+    }
+
+    fn remove_commitment(&mut self, c: Hash256, at: u64) {
+        self.commitments.remove(&c);
+        self.commitments_by_height.remove(&(at, c));
+        self.tree.remove(&commitment_key(&c));
+    }
+
+    /// Sets or clears a name's record, returning the previous one.
+    fn put_name(&mut self, name: &Name, record: Option<NameRecord>) -> Option<NameRecord> {
+        match record {
+            Some(r) => {
+                self.tree.insert(name_key(name), name_value(&r));
+                self.names.insert(name.clone(), r)
+            }
+            None => {
+                self.tree.remove(&name_key(name));
+                self.names.remove(name)
+            }
+        }
+    }
+
     fn set_name(&mut self, name: &Name, record: NameRecord, undo: &mut Undo) {
-        let prev = self.names.insert(name.clone(), record);
+        let prev = self.put_name(name, Some(record));
         undo.entries.push(UndoEntry::Name(name.clone(), prev));
     }
 
@@ -251,8 +381,7 @@ impl State {
                 if self.commitments.contains_key(commitment) {
                     return Err(TxError::DuplicateCommitment);
                 }
-                self.commitments.insert(*commitment, height);
-                self.commitments_by_height.insert((height, *commitment));
+                self.insert_commitment(*commitment, height);
                 undo.entries
                     .push(UndoEntry::CommitmentAdded(*commitment, height));
             }
@@ -269,8 +398,7 @@ impl State {
                 if self.names.get(name).is_some_and(|r| r.is_active(height)) {
                     return Err(TxError::NameTaken);
                 }
-                self.commitments.remove(&commitment);
-                self.commitments_by_height.remove(&(at, commitment));
+                self.remove_commitment(commitment, at);
                 undo.entries
                     .push(UndoEntry::CommitmentRemoved(commitment, at));
                 let record = NameRecord {
@@ -397,7 +525,60 @@ impl<'a> BlockBuilder<'a> {
     }
 
     pub fn finish(self) -> Block {
-        Block::new(self.undo.prev_tip, self.state.height - 1, self.txs)
+        let root = self.state.state_root();
+        Block::new(self.undo.prev_tip, self.state.height - 1, self.txs, root)
+    }
+}
+
+/// A snapshot of the whole state, so a node can restart without replaying
+/// the chain from genesis. Not consensus: the node checks a decoded snapshot
+/// against its block's `state_root` before using it.
+impl Encode for State {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.tip.encode(out);
+        put_u64(out, self.height);
+        put_u32(
+            out,
+            u32::try_from(self.names.len()).expect("name count fits in u32"),
+        );
+        for (name, record) in &self.names {
+            name.encode(out);
+            record.encode(out);
+        }
+        put_u32(
+            out,
+            u32::try_from(self.commitments_by_height.len()).expect("commitment count fits in u32"),
+        );
+        for (at, c) in &self.commitments_by_height {
+            c.encode(out);
+            put_u64(out, *at);
+        }
+    }
+}
+
+impl Decode for State {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let mut state = State {
+            tip: Hash256::decode(r)?,
+            height: r.u64()?,
+            ..State::new()
+        };
+        for _ in 0..r.u32()? {
+            let name = Name::decode(r)?;
+            let record = NameRecord::decode(r)?;
+            if state.put_name(&name, Some(record)).is_some() {
+                return Err(DecodeError::Invalid("duplicate name"));
+            }
+        }
+        for _ in 0..r.u32()? {
+            let c = Hash256::decode(r)?;
+            let at = r.u64()?;
+            if state.commitments.contains_key(&c) {
+                return Err(DecodeError::Invalid("duplicate commitment"));
+            }
+            state.insert_commitment(c, at);
+        }
+        Ok(state)
     }
 }
 

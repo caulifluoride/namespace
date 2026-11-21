@@ -145,7 +145,12 @@ mod tests {
         let commit = Tx::Commit {
             commitment: Hash256([tag; 32]),
         };
-        Block::new(parent.hash(), parent.header.height, vec![commit])
+        Block::new(
+            parent.hash(),
+            parent.header.height,
+            vec![commit],
+            Hash256::ZERO,
+        )
     }
 
     fn anchor(btc_height: u32, block: &Block) -> Anchor {

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use anyhow::{Context, Result};
 use bitcoin::OutPoint;
 use bitcoin::secp256k1::{Secp256k1, VerifyOnly};
+use namespace_core::encode::Decode;
 use namespace_core::state::{AddTxError, Undo};
 use namespace_core::{
     Block, BlockBuilder, BlockHash, ChainIndex, CovenantConfig, Hash256, Params, State, Tx,
@@ -19,6 +20,8 @@ use crate::store::{ScanRecord, Store};
 /// can make them.
 const MAX_PENDING_BLOCKS: usize = 64;
 const MAX_MEMPOOL_TXS: usize = 50_000;
+/// Snapshot the state every this many blocks.
+const SNAPSHOT_INTERVAL: u64 = 1_000;
 
 pub struct Chain {
     params: Params,
@@ -27,7 +30,11 @@ pub struct Chain {
     index: ChainIndex,
     state: State,
     /// The applied chain after genesis, with what's needed to revert it.
-    active: Vec<(BlockHash, Undo)>,
+    /// Blocks loaded from a snapshot have no undo: reverting past them means
+    /// replaying from genesis.
+    active: Vec<(BlockHash, Option<Undo>)>,
+    /// Height of the last snapshot taken or loaded.
+    snapshot_height: u64,
     scans: BTreeMap<u32, ScanRecord>,
     pending: VecDeque<Block>,
     mempool: Vec<Tx>,
@@ -51,7 +58,8 @@ impl AddBlock {
 }
 
 impl Chain {
-    /// Loads everything from `store` and replays the best chain.
+    /// Loads everything from `store` and replays the best chain, starting
+    /// from the newest snapshot on it.
     pub fn load(params: Params, covenant: CovenantConfig, store: &Store) -> Result<Self> {
         let mut chain = Self {
             params,
@@ -60,6 +68,7 @@ impl Chain {
             index: ChainIndex::new(),
             state: State::new(),
             active: Vec::new(),
+            snapshot_height: 0,
             scans: BTreeMap::new(),
             pending: VecDeque::new(),
             mempool: Vec::new(),
@@ -74,8 +83,57 @@ impl Chain {
             }
             chain.scans.insert(height, record);
         }
+        for hash in store.invalid_blocks()? {
+            chain.index.mark_invalid(hash);
+        }
+        chain.load_snapshot(store)?;
         chain.update_tip(store)?;
         Ok(chain)
+    }
+
+    /// Starts from the newest snapshot whose block is on the best chain and
+    /// whose contents match that block's state root.
+    fn load_snapshot(&mut self, store: &Store) -> Result<()> {
+        let best = self.index.best_chain();
+        for (height, bytes) in store.snapshots()? {
+            let state = match State::from_bytes(&bytes) {
+                Ok(s) if s.height() == height => s,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(height, error = %e, "unreadable snapshot");
+                    continue;
+                }
+            };
+            let Some(pos) = height.checked_sub(1) else {
+                continue;
+            };
+            if best.get(pos as usize) != Some(&state.tip()) {
+                continue;
+            }
+            let block = store
+                .block(&state.tip())?
+                .with_context(|| format!("indexed block {} missing from store", state.tip()))?;
+            if block.header.state_root != state.state_root() {
+                warn!(height, "snapshot does not match its block's state root");
+                continue;
+            }
+            info!(height, tip = %state.tip(), "loaded snapshot");
+            self.active = best[..height as usize].iter().map(|h| (*h, None)).collect();
+            self.state = state;
+            self.snapshot_height = height;
+            break;
+        }
+        Ok(())
+    }
+
+    /// Stores a snapshot of the current state.
+    pub fn save_snapshot(&mut self, store: &Store) -> Result<()> {
+        let height = self.state.height();
+        if height > 0 {
+            store.put_snapshot(height, &self.state)?;
+            self.snapshot_height = height;
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> &State {
@@ -227,15 +285,29 @@ impl Chain {
         let mut disconnected = Vec::new();
         loop {
             let best = self.index.best_chain();
-            let common = self
+            let mut common = self
                 .active
                 .iter()
                 .zip(&best)
                 .take_while(|((a, _), b)| a == *b)
                 .count();
+            if self.active[common..].iter().any(|(_, undo)| undo.is_none()) {
+                warn!(
+                    height = common,
+                    "reorg below the snapshot; replaying from genesis"
+                );
+                for (hash, _) in self.active[common..].iter().rev() {
+                    if let Some(block) = store.block(hash)? {
+                        disconnected.push(block.txs);
+                    }
+                }
+                self.state = State::new();
+                self.active.clear();
+                common = 0;
+            }
             while self.active.len() > common {
                 let (hash, undo) = self.active.pop().expect("non-empty");
-                self.state.revert(undo);
+                self.state.revert(undo.expect("checked above"));
                 if let Some(block) = store.block(&hash)? {
                     disconnected.push(block.txs);
                 }
@@ -246,10 +318,11 @@ impl Chain {
                     .block(hash)?
                     .with_context(|| format!("indexed block {hash} missing from store"))?;
                 match self.state.apply_block(&block, &self.params, &self.secp) {
-                    Ok(undo) => self.active.push((*hash, undo)),
+                    Ok(undo) => self.active.push((*hash, Some(undo))),
                     Err(e) => {
                         warn!(block = %hash, error = %e, "invalid block");
                         self.index.mark_invalid(*hash);
+                        store.put_invalid(hash)?;
                         failed = true;
                         break;
                     }
@@ -265,6 +338,9 @@ impl Chain {
             let resurrected = disconnected.into_iter().rev().flatten();
             let pending = std::mem::take(&mut self.mempool);
             self.refill_mempool(resurrected.chain(pending));
+        }
+        if self.state.height() >= self.snapshot_height + SNAPSHOT_INTERVAL {
+            self.save_snapshot(store)?;
         }
         Ok(())
     }
@@ -284,6 +360,7 @@ mod tests {
     use bitcoin::Txid;
     use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{Keypair, SecretKey};
+    use namespace_core::Encode;
     use namespace_core::tx::commitment_hash;
     use namespace_core::{Anchor, Name};
 
@@ -349,6 +426,14 @@ mod tests {
             self.chain
                 .add_scan(&self.store, self.btc_height, record)
                 .unwrap();
+        }
+
+        /// The valid block on the current tip with exactly `txs`.
+        fn next_block(&self, txs: Vec<Tx>) -> Block {
+            self.chain
+                .state
+                .next_block(txs, &self.chain.params, &self.chain.secp)
+                .unwrap()
         }
 
         /// Builds a block from the mempool, anchors it, and returns it.
@@ -424,13 +509,9 @@ mod tests {
         let a = f.build_and_mine();
 
         // Someone anchors a block but never publishes it.
-        let withheld = Block::new(
-            a.hash(),
-            1,
-            vec![Tx::Commit {
-                commitment: Hash256([9; 32]),
-            }],
-        );
+        let withheld = f.next_block(vec![Tx::Commit {
+            commitment: Hash256([9; 32]),
+        }]);
         f.mine(Some(&withheld));
         assert_eq!(f.chain.missing_bodies(), vec![withheld.hash()]);
         assert_eq!(f.chain.state().tip(), a.hash());
@@ -454,7 +535,7 @@ mod tests {
     fn late_body_is_applied() {
         let mut f = Fixture::new("late");
         let (commit, _) = register_txs("alice", &keypair());
-        let block = Block::new(Block::genesis().hash(), 0, vec![commit]);
+        let block = f.next_block(vec![commit]);
         f.mine(Some(&block));
         assert_eq!(f.chain.state().height(), 0);
         assert_eq!(
@@ -469,7 +550,7 @@ mod tests {
         let mut f = Fixture::new("invalid");
         let (_, register) = register_txs("alice", &keypair());
         // Registers without a commitment: anchored, but invalid.
-        let bad = Block::new(Block::genesis().hash(), 0, vec![register]);
+        let bad = Block::new(Block::genesis().hash(), 0, vec![register], Hash256::ZERO);
         f.mine(Some(&bad));
         assert_eq!(f.chain.add_block(&f.store, bad).unwrap(), AddBlock::Stored);
         assert_eq!(f.chain.state().height(), 0);
@@ -497,19 +578,20 @@ mod tests {
     #[test]
     fn unanchored_blocks_must_extend_tip() {
         let mut f = Fixture::new("pending");
-        let a = f.build_and_mine();
+        f.build_and_mine();
         let stale = Block::new(
             Block::genesis().hash(),
             0,
             vec![Tx::Commit {
                 commitment: Hash256([1; 32]),
             }],
+            Hash256::ZERO,
         );
         assert!(matches!(
             f.chain.add_block(&f.store, stale).unwrap(),
             AddBlock::Rejected(_)
         ));
-        let next = Block::new(a.hash(), 1, vec![]);
+        let next = f.next_block(vec![]);
         assert_eq!(
             f.chain.add_block(&f.store, next.clone()).unwrap(),
             AddBlock::Pending
@@ -519,5 +601,82 @@ mod tests {
         f.mine(Some(&next));
         assert_eq!(f.chain.state().tip(), next.hash());
         assert!(f.store.block(&next.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn restart_resumes_from_snapshot() {
+        let mut f = Fixture::new("snapshot");
+        let (commit, register) = register_txs("alice", &keypair());
+        f.chain.submit_tx(commit).unwrap();
+        f.build_and_mine();
+        f.chain.submit_tx(register).unwrap();
+        f.build_and_mine();
+        f.chain.save_snapshot(&f.store).unwrap();
+        f.build_and_mine();
+        let tip = f.chain.state().tip();
+
+        f.reload();
+        assert_eq!(f.chain.state().tip(), tip);
+        assert_eq!(f.chain.state().height(), 3);
+        // Blocks 1-2 came from the snapshot, block 3 was replayed.
+        let undos: Vec<_> = f.chain.active.iter().map(|(_, u)| u.is_some()).collect();
+        assert_eq!(undos, vec![false, false, true]);
+        assert!(
+            f.chain
+                .state()
+                .lookup(&Name::new("alice").unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn tampered_snapshot_is_ignored() {
+        let mut f = Fixture::new("bad-snapshot");
+        f.build_and_mine();
+        let (commit, _) = register_txs("alice", &keypair());
+        f.chain.submit_tx(commit).unwrap();
+        f.build_and_mine();
+        // A snapshot claiming block 2's tip, but with block 1's contents.
+        let mut wrong = f.chain.state().clone();
+        let undo = f.chain.active.last().unwrap().1.clone().unwrap();
+        wrong.revert(undo);
+        let tip = f.chain.state().tip();
+        let bytes = wrong.to_bytes();
+        let wrong =
+            State::from_bytes(&[&tip.0[..], &2u64.to_le_bytes(), &bytes[40..]].concat()).unwrap();
+        assert_eq!((wrong.tip(), wrong.height()), (tip, 2));
+        f.store.put_snapshot(2, &wrong).unwrap();
+
+        let root = f.chain.state().state_root();
+        f.reload();
+        assert_eq!(f.chain.state().state_root(), root);
+        assert!(f.chain.active.iter().all(|(_, u)| u.is_some()));
+    }
+
+    #[test]
+    fn reorg_below_snapshot_replays_from_genesis() {
+        let mut f = Fixture::new("snapshot-reorg");
+        let a = f.build_and_mine();
+        let (commit, _) = register_txs("alice", &keypair());
+        f.chain.submit_tx(commit).unwrap();
+        f.build_and_mine();
+        f.chain.save_snapshot(&f.store).unwrap();
+        f.reload();
+        assert!(f.chain.active.iter().all(|(_, u)| u.is_none()));
+
+        f.chain.rollback_scans(&f.store, 2).unwrap();
+        f.btc_height = 1;
+        assert_eq!(f.chain.state().tip(), a.hash());
+        assert_eq!(f.chain.mempool_len(), 1);
+    }
+
+    #[test]
+    fn invalid_blocks_are_remembered() {
+        let mut f = Fixture::new("invalid-persist");
+        let (_, register) = register_txs("alice", &keypair());
+        let bad = Block::new(Block::genesis().hash(), 0, vec![register], Hash256::ZERO);
+        f.mine(Some(&bad));
+        f.chain.add_block(&f.store, bad.clone()).unwrap();
+        assert_eq!(f.store.invalid_blocks().unwrap(), vec![bad.hash()]);
     }
 }

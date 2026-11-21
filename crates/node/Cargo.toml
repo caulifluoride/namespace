@@ -23,3 +23,4 @@ tracing-subscriber.workspace = true
 axum = "0.8"
 iroh = "1"
 redb = "4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

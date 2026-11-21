@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 namespace-core = { path = "crates/core" }
 anyhow = "1"
-bitcoin = { version = "0.32", features = ["serde", "rand-std"] }
+bitcoin = { version = "0.32", features = ["serde", "rand-std", "base64"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

@@ -1,15 +1,22 @@
 //! `ns`: a wallet for namespace names. Holds one key, builds and signs
-//! transactions, and talks to a node's local RPC.
+//! transactions, and talks to a node's local RPC. Also builds the Bitcoin
+//! side: the covenant chain, and the transactions that anchor blocks to it.
+
+mod covenant;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, rand};
-use clap::{Parser, Subcommand};
+use bitcoin::{Address, Amount, Network, OutPoint, Psbt, ScriptBuf, TxOut};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use namespace_core::tx::{SignedOp, commitment_hash, sighash, sign};
-use namespace_core::{Encode, Hash256, Name, NameRecord, OwnerKey, Tx};
+use namespace_core::{Encode, Hash256, Name, NameProof, NameRecord, OwnerKey, Tx};
 use serde_json::Value;
+
+use crate::covenant::ChainFile;
 
 #[derive(Parser)]
 #[command(name = "ns", about = "Namespace wallet")]
@@ -34,6 +41,9 @@ enum Cmd {
     Status,
     /// Look up who owns a name.
     Lookup { name: Name },
+    /// Fetch a proof of a name's record and check it against the node's
+    /// state root.
+    Proof { name: Name },
     /// Step 1 of registering: commit to a name without revealing it.
     Commit { name: Name },
     /// Step 2 of registering: reveal a committed name.
@@ -44,6 +54,69 @@ enum Cmd {
     Transfer { name: Name, new_owner: OwnerKey },
     /// Ask the node to build a block from its mempool, for anchoring.
     Build,
+    /// Build a block and the Bitcoin transaction that anchors it, as a PSBT
+    /// for your Bitcoin wallet to sign.
+    Anchor(AnchorArgs),
+    /// Finalize a signed anchoring PSBT and print the package to broadcast.
+    Finalize {
+        /// The signed PSBT, base64.
+        psbt: String,
+    },
+    /// Create the covenant chain (done once, by whoever launches the chain).
+    #[command(subcommand)]
+    Covenant(CovenantCmd),
+}
+
+#[derive(Subcommand)]
+enum CovenantCmd {
+    /// Step 1: create the covenant key and print the address to fund.
+    Keygen {
+        /// Where to keep the key until `sign` deletes it.
+        #[arg(long)]
+        key_out: PathBuf,
+        #[arg(long, default_value_t = Network::Bitcoin)]
+        network: Network,
+    },
+    /// Step 2: once the address is funded, sign the chain and delete the key.
+    Sign {
+        #[arg(long)]
+        key: PathBuf,
+        /// The output that funded the address, `txid:vout`.
+        #[arg(long)]
+        funding: OutPoint,
+        /// Its amount, in sats. Carried along the whole chain.
+        #[arg(long)]
+        amount: u64,
+        /// Covenant transactions to sign: one per anchored block.
+        #[arg(long)]
+        count: u32,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(ClapArgs)]
+struct AnchorArgs {
+    /// The covenant chain file from `ns covenant sign`.
+    #[arg(long)]
+    chain: PathBuf,
+    /// A UTXO of yours that pays the fee, `txid:vout`. P2TR or P2WPKH.
+    #[arg(long)]
+    utxo: OutPoint,
+    /// Its amount, in sats.
+    #[arg(long)]
+    utxo_amount: u64,
+    /// Its address.
+    #[arg(long)]
+    utxo_address: Address<NetworkUnchecked>,
+    /// Where the rest of the UTXO goes.
+    #[arg(long)]
+    change: Address<NetworkUnchecked>,
+    /// Fee rate for the covenant transaction and the child together, sat/vB.
+    #[arg(long)]
+    fee_rate: f64,
+    #[arg(long, default_value_t = Network::Bitcoin)]
+    network: Network,
 }
 
 struct Wallet {
@@ -73,6 +146,7 @@ async fn main() -> Result<()> {
             Some(record) => print_json(&record),
             None => println!("{name} is not registered"),
         },
+        Cmd::Proof { name } => w.proof(name).await?,
         Cmd::Commit { name } => w.commit(name).await?,
         Cmd::Register { name } => w.register(name).await?,
         Cmd::Renew { name } => {
@@ -101,11 +175,90 @@ async fn main() -> Result<()> {
             };
             w.submit(&tx).await?;
         }
-        Cmd::Build => {
-            let resp = w.http.post(format!("{}/build", w.node)).send().await?;
-            print_json(&check(resp).await?.json::<Value>().await?);
+        Cmd::Build => print_json(&w.build().await?),
+        Cmd::Anchor(a) => w.anchor(a).await?,
+        Cmd::Finalize { psbt } => finalize(&psbt)?,
+        Cmd::Covenant(CovenantCmd::Keygen { key_out, network }) => {
+            covenant_keygen(&key_out, network)?
         }
+        Cmd::Covenant(CovenantCmd::Sign {
+            key,
+            funding,
+            amount,
+            count,
+            out,
+        }) => covenant_sign(&key, funding, Amount::from_sat(amount), count, &out)?,
     }
+    Ok(())
+}
+
+fn covenant_keygen(path: &Path, network: Network) -> Result<()> {
+    if path.exists() {
+        bail!("{} already exists", path.display());
+    }
+    let secp = Secp256k1::new();
+    let sk = SecretKey::new(&mut rand::thread_rng());
+    write_private(path, &sk.display_secret().to_string())?;
+    let kp = Keypair::from_secret_key(&secp, &sk);
+    let address = Address::from_script(&covenant::covenant_script(&secp, &kp), network)?;
+    println!("{address}");
+    eprintln!(
+        "fund this address with one output (at least {} sats), then run `ns covenant sign`",
+        covenant::MIN_COVENANT_VALUE.to_sat()
+    );
+    Ok(())
+}
+
+fn covenant_sign(
+    key: &Path,
+    funding: OutPoint,
+    amount: Amount,
+    count: u32,
+    out: &Path,
+) -> Result<()> {
+    if out.exists() {
+        bail!("{} already exists", out.display());
+    }
+    let secp = Secp256k1::new();
+    let hex_key =
+        std::fs::read_to_string(key).with_context(|| format!("reading {}", key.display()))?;
+    let sk: SecretKey = hex_key.trim().parse().context("parsing covenant key")?;
+    let kp = Keypair::from_secret_key(&secp, &sk);
+    let txs = covenant::generate(&secp, &kp, funding, amount, count)?;
+    let file = ChainFile {
+        start: funding,
+        value: amount,
+        covenant_vout: covenant::COVENANT_VOUT,
+        anchor_vout: covenant::ANCHOR_VOUT,
+        txs: txs
+            .iter()
+            .map(bitcoin::consensus::encode::serialize_hex)
+            .collect(),
+    };
+    std::fs::write(out, serde_json::to_string(&file)?)?;
+    // The covenant only holds if nobody can sign another spend.
+    let len = std::fs::metadata(key)?.len() as usize;
+    std::fs::write(key, vec![0u8; len])?;
+    std::fs::remove_file(key)?;
+    println!(
+        "wrote {count} covenant transactions to {}; deleted {}",
+        out.display(),
+        key.display()
+    );
+    println!(
+        "start nodes with --covenant-start {funding} --covenant-start-height <the height the funding tx confirmed at> \\\n  --covenant-vout {} --anchor-vout {}",
+        covenant::COVENANT_VOUT,
+        covenant::ANCHOR_VOUT
+    );
+    Ok(())
+}
+
+fn finalize(psbt: &str) -> Result<()> {
+    let psbt: Psbt = psbt.trim().parse().context("parsing PSBT")?;
+    let child = covenant::finalize(psbt)?;
+    println!("{}", bitcoin::consensus::encode::serialize_hex(&child));
+    eprintln!("broadcast with the covenant transaction printed by `ns anchor`:");
+    eprintln!("  bitcoin-cli submitpackage '[\"<covenant tx>\", \"<this tx>\"]'");
     Ok(())
 }
 
@@ -215,6 +368,85 @@ impl Wallet {
         .await?;
         salts.remove(&name);
         self.save_salts(&salts)?;
+        Ok(())
+    }
+
+    async fn build(&self) -> Result<Value> {
+        let resp = self
+            .http
+            .post(format!("{}/build", self.node))
+            .send()
+            .await?;
+        Ok(check(resp).await?.json().await?)
+    }
+
+    async fn anchor(&self, a: AnchorArgs) -> Result<()> {
+        let chain: ChainFile = serde_json::from_str(
+            &std::fs::read_to_string(&a.chain)
+                .with_context(|| format!("reading {}", a.chain.display()))?,
+        )?;
+        let utxo_address = a.utxo_address.require_network(a.network)?;
+        let change = a.change.require_network(a.network)?;
+
+        let built = self.build().await?;
+        let field = |k: &str| {
+            built[k]
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("node /build response has no {k}"))
+        };
+        let outpoint: OutPoint = field("covenant_outpoint")?.parse()?;
+        let op_return = ScriptBuf::from_hex(&field("op_return")?)?;
+        if built["anchor_vout"].as_u64() != Some(u64::from(chain.anchor_vout)) {
+            bail!("the node's anchor_vout doesn't match {}", a.chain.display());
+        }
+        let parent = chain.spending(outpoint)?.with_context(|| {
+            format!(
+                "no covenant transaction in {} spends {outpoint}",
+                a.chain.display()
+            )
+        })?;
+
+        let psbt = covenant::anchor_child(
+            &parent,
+            chain.anchor_vout,
+            op_return,
+            a.utxo,
+            TxOut {
+                value: Amount::from_sat(a.utxo_amount),
+                script_pubkey: utxo_address.script_pubkey(),
+            },
+            change.script_pubkey(),
+            a.fee_rate,
+        )?;
+        println!("block: {} (height {})", field("hash")?, built["height"]);
+        println!(
+            "covenant tx: {}",
+            bitcoin::consensus::encode::serialize_hex(&parent)
+        );
+        println!("child psbt: {psbt}");
+        eprintln!("sign the PSBT with your wallet (e.g. `bitcoin-cli walletprocesspsbt <psbt>`),");
+        eprintln!("then run `ns finalize <signed psbt>` and broadcast both as a package.");
+        Ok(())
+    }
+
+    /// Checks the proof against the root the node reports. That only shows
+    /// the node is self-consistent; a light client would take the root from
+    /// a header it trusts.
+    async fn proof(&self, name: Name) -> Result<()> {
+        let v = self
+            .get(&format!("/proof/{name}"))
+            .await?
+            .context("node has no /proof endpoint")?;
+        let root: Hash256 = serde_json::from_value(v["state_root"].clone())?;
+        let height = v["height"].as_u64().context("no height in proof")?;
+        let proof: NameProof = serde_json::from_value(v.clone())?;
+        match proof.verify(&name, &root)? {
+            Some(rec) if rec.is_active(height) => print_json(&serde_json::to_value(rec)?),
+            Some(rec) => println!("{name} expired at height {}", rec.expires_at),
+            None => println!("{name} is not registered"),
+        }
+        println!("proven against state root {root} at height {height}");
         Ok(())
     }
 

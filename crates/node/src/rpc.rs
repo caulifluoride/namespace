@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use namespace_core::anchor::commitment_script;
 use namespace_core::encode::Decode;
-use namespace_core::{Block, BlockHash, Hash256, Name, NameRecord, Tx};
+use namespace_core::{Block, BlockHash, Hash256, Name, NameProof, NameRecord, Tx};
 use serde::{Deserialize, Serialize};
 
 use crate::node::Node;
@@ -19,6 +19,7 @@ pub fn router(node: Arc<Node>) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/name/{name}", get(name))
+        .route("/proof/{name}", get(proof))
         .route("/commitment/{hash}", get(commitment))
         .route("/block/{hash}", get(block))
         .route("/tx", post(submit_tx))
@@ -36,11 +37,13 @@ fn error(status: StatusCode, msg: impl ToString) -> Response {
 pub struct Status {
     pub height: u64,
     pub tip: BlockHash,
+    pub state_root: Hash256,
     pub next_btc_height: u32,
     pub covenant_outpoint: String,
     pub mempool: usize,
     pub missing_bodies: usize,
     pub endpoint_id: String,
+    pub peers: usize,
     pub registration_cap: u32,
 }
 
@@ -50,11 +53,13 @@ async fn status(State(node): AppState) -> Json<Status> {
     Json(Status {
         height: state.height(),
         tip: state.tip(),
+        state_root: state.state_root(),
         next_btc_height: chain.next_scan_height(),
         covenant_outpoint: chain.covenant_outpoint().to_string(),
         mempool: chain.mempool_len(),
         missing_bodies: chain.missing_bodies().len(),
         endpoint_id: node.endpoint.id().to_string(),
+        peers: node.peer_count(),
         registration_cap: chain.params().registration_cap(state.height() + 1),
     })
 }
@@ -71,6 +76,33 @@ async fn name(
         .copied()
         .map(Json)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "name not registered"))
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProofResponse {
+    /// The block whose `state_root` the proof is against.
+    pub tip: BlockHash,
+    pub height: u64,
+    pub state_root: Hash256,
+    #[serde(flatten)]
+    pub proof: NameProof,
+}
+
+/// A proof of a name's record, or of it having none, against the tip's
+/// state root. Unlike `/name`, this also returns expired records.
+async fn proof(
+    State(node): AppState,
+    Path(name): Path<String>,
+) -> Result<Json<ProofResponse>, Response> {
+    let name = Name::new(&name).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    let chain = node.chain();
+    let state = chain.state();
+    Ok(Json(ProofResponse {
+        tip: state.tip(),
+        height: state.height(),
+        state_root: state.state_root(),
+        proof: state.prove_name(&name),
+    }))
 }
 
 async fn commitment(
