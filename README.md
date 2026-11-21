@@ -40,11 +40,11 @@ depend on where its anchor lands.
 
 ## Layout
 
-| crate | |
-|---|---|
+| crate         |                                                                                                             |
+| ---           | ---                                                                                                         |
 | `crates/core` | Consensus: encoding, hashing, txs, blocks, state transition with undo, anchor scanning, fork choice. No IO. |
-| `crates/node` | `namespaced`: Bitcoin follower, redb storage, iroh P2P (block/tx propagation), local HTTP RPC. |
-| `crates/cli` | `ns`: wallet (keygen, commit, register, renew, transfer, lookup) and block-build trigger. |
+| `crates/node` | `namespaced`: Bitcoin follower, redb storage, iroh P2P (block/tx propagation), local HTTP RPC.              |
+| `crates/cli`  | `ns`: wallet (keygen, commit, register, renew, transfer, lookup) and block-build trigger.                   |
 
 The node stores only block bodies and Bitcoin scan records. It rebuilds the name state on
 startup by replaying the best chain.
@@ -67,8 +67,7 @@ ns build             # builders: assemble a block, get the OP_RETURN to anchor
 
 ## Not done yet
 
-- Bitcoin backends (Core RPC, Esplora, libbitcoin) are placeholders in
-  `crates/node/src/bitcoin_source.rs`.
+- Bitcoin backends (Core RPC, Esplora, libbitcoin) are placeholders in `crates/node/src/bitcoin_source.rs`.
 - Tooling to generate the pre-signed covenant chain, and to construct the anchoring CPFP child.
 - Peer discovery beyond `--peer` and peers that connect to us.
 - A state commitment in block headers, for light clients and name proofs.
