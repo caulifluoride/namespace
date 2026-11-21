@@ -3,6 +3,9 @@
 A blockchain for names, anchored in Bitcoin. Its only asset is names: there are no coins,
 no fees and no block rewards.
 
+For a walkthrough of the design, see the
+[explanation resource](https://claude.ai/artifact/Bip8AmkcE6L6jxXJUwhHuH).
+
 ## Design
 
 **Consensus is Bitcoin's.** Namespace blocks are blind merge-mined using a Somsen-style
