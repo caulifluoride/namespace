@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>namespace</title>
+<meta name="description" content="How namespace works: a blockchain for names, anchored in Bitcoin, with no coins and no fees.">
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --surface: #f1efe8;
+    --text: #1d1c1a;
+    --muted: #65625b;
+    --line: #d9d5ca;
+    --accent: #b4521e;
+    --accent-soft: #f3e1d4;
+    --good: #2f6f4f;
+    --code-bg: #ece9e0;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161513;
+      --surface: #201f1c;
+      --text: #ecebe6;
+      --muted: #a29f96;
+      --line: #36342f;
+      --accent: #e8874f;
+      --accent-soft: #3a2619;
+      --good: #6fbf93;
+      --code-bg: #26241f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 17px/1.6 var(--serif);
+  }
+  main { max-width: 46rem; margin: 0 auto; padding: 0 16px 6rem; }
+  header.hero { padding: 4.5rem 0 2.5rem; border-bottom: 1px solid var(--line); margin-bottom: 1rem; }
+  .eyebrow { font: 600 0.8rem/1 var(--sans); letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
+  h1 { font: 700 clamp(2.4rem, 7vw, 3.6rem)/1.05 var(--sans); letter-spacing: -0.03em; margin: 0.6rem 0 1rem; }
+  .lede { font-size: 1.2rem; color: var(--muted); margin: 0; max-width: 36rem; }
+  nav.toc { font: 0.9rem/1.5 var(--sans); display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; padding: 1rem 0 0; }
+  nav.toc a { color: var(--muted); text-decoration: none; border-bottom: 1px solid transparent; }
+  nav.toc a:hover { color: var(--text); border-color: var(--accent); }
+  h2 { font: 700 1.6rem/1.2 var(--sans); letter-spacing: -0.015em; margin: 3.5rem 0 0.8rem; }
+  h2 .num { color: var(--accent); font-variant-numeric: tabular-nums; margin-right: 0.4rem; }
+  h3 { font: 650 1.1rem/1.3 var(--sans); margin: 2rem 0 0.4rem; }
+  p, li { hyphens: auto; }
+  a { color: var(--accent); }
+  code { font: 0.86em var(--mono); background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+  pre { font: 0.85rem/1.55 var(--mono); background: var(--code-bg); padding: 1rem 1.1rem; border-radius: 8px; overflow-x: auto; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  figure { margin: 1.8rem 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font: 0.85rem/1.5 var(--sans); color: var(--muted); margin-top: 0.6rem; }
+  .callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 0.9rem 1.1rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout p { margin: 0; }
+  .callout p + p { margin-top: 0.6rem; }
+  .table-wrap { overflow-x: auto; margin: 1.2rem 0; }
+  table { border-collapse: collapse; width: 100%; font: 0.9rem/1.45 var(--sans); }
+  th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 650; color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  ol.steps { padding-left: 1.2rem; }
+  ol.steps li { margin: 0.4rem 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: 0.8rem; margin: 1.4rem 0; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; font: 0.92rem/1.5 var(--sans); }
+  .card b { display: block; margin-bottom: 0.25rem; }
+  footer { margin-top: 5rem; padding-top: 1.5rem; border-top: 1px solid var(--line); font: 0.85rem/1.5 var(--sans); color: var(--muted); }
+  /* SVG theming */
+  .svg-box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+  .svg-accent { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+  .svg-line { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+  .svg-accent-line { stroke: var(--accent); stroke-width: 2; fill: none; }
+  .svg-good-line { stroke: var(--good); stroke-width: 2; fill: none; }
+  .svg-text { fill: var(--text); font: 13px var(--sans); }
+  .svg-small { fill: var(--muted); font: 11.5px var(--sans); }
+  .svg-mono { fill: var(--text); font: 12px var(--mono); }
+  .svg-arrow { fill: var(--muted); }
+  .svg-arrow-accent { fill: var(--accent); }
+  .svg-bar { fill: var(--accent); }
+  .svg-bar-soft { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+</style>
+</head>
+<body>
+<main>
+
+<header class="hero">
+  <div class="eyebrow">How it works</div>
+  <h1>namespace</h1>
+  <p class="lede">A blockchain for names, anchored in Bitcoin. Its only asset is names: there are no coins, no fees and no block rewards. Bitcoin decides which blocks count, and the rules decide who gets which name.</p>
+  <nav class="toc" aria-label="Contents">
+    <a href="#overview">Overview</a>
+    <a href="#anchoring">Anchoring</a>
+    <a href="#builders">Builders</a>
+    <a href="#forks">Fork choice</a>
+    <a href="#names">Names</a>
+    <a href="#announcements">Announcements</a>
+    <a href="#tiers">Tiers</a>
+    <a href="#state">State &amp; proofs</a>
+    <a href="#params">Parameters</a>
+    <a href="#running">Running it</a>
+    <a href="#open">Open problems</a>
+  </nav>
+</header>
+
+<section id="overview">
+<h2><span class="num">1</span>Overview</h2>
+<p>Names are 1–63 characters of <code>a-z</code>, <code>0-9</code> and <code>-</code>, each mapping to an owner's BIP340 public key. The chain records who owns what and nothing else.</p>
+<p>The chain has no miners or validators of its own. Each namespace block is <em>anchored</em> by a Bitcoin transaction that commits to its hash. Bitcoin's proof of work orders the anchors, and every node applies the same rules to the anchored blocks, so they all agree on the same names.</p>
+<div class="grid">
+  <div class="card"><b>Bitcoin</b>Orders anchors and limits them to one every 3 Bitcoin blocks. It knows nothing about names.</div>
+  <div class="card"><b>Builders</b>Assemble namespace blocks, sign them, and pay the Bitcoin fee to anchor them.</div>
+  <div class="card"><b>Nodes</b>Follow Bitcoin, collect block bodies, apply the rules, and serve lookups and proofs.</div>
+  <div class="card"><b>Owners</b>Hold a key per name. They renew and transfer names by signing.</div>
+</div>
+</section>
+
+<section id="anchoring">
+<h2><span class="num">2</span>Anchoring in Bitcoin</h2>
+<p>Namespace blocks are blind merge-mined using Ruben Somsen's spacechain design. A chain of Bitcoin transactions is signed in advance and then the signing key is deleted. Each covenant transaction <code>T<sub>i</sub></code> spends the previous one's covenant output and creates two outputs:</p>
+<ul>
+  <li>a <strong>covenant output</strong>, which only <code>T<sub>i+1</sub></code> can spend, and</li>
+  <li>a zero-value <strong>pay-to-anchor (P2A) output</strong>, which anyone can spend.</li>
+</ul>
+<p>Covenant transactions pay no fee. To anchor a block, a builder broadcasts <code>T<sub>i</sub></code> together with a child that spends its P2A output and carries <code>OP_RETURN "NSPC" &lt;block hash&gt;</code>. The child pays the fee for both. Only one child can spend the P2A output, so each covenant transaction anchors at most one block, and Bitcoin miners just take the child that pays the most.</p>
+
+<figure>
+<svg viewBox="0 0 680 230" role="img" aria-labelledby="cov-title">
+  <title id="cov-title">The covenant chain: each covenant transaction spends the last one's covenant output, and a builder's child spends its anchor output</title>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="svg-arrow"/></marker>
+    <marker id="arr-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="svg-arrow-accent"/></marker>
+  </defs>
+  <!-- covenant txs -->
+  <g>
+    <rect x="20" y="30" width="150" height="62" rx="8" class="svg-box"/>
+    <text x="95" y="56" text-anchor="middle" class="svg-mono">T₁</text>
+    <text x="95" y="76" text-anchor="middle" class="svg-small">Bitcoin block h</text>
+  </g>
+  <g>
+    <rect x="265" y="30" width="150" height="62" rx="8" class="svg-box"/>
+    <text x="340" y="56" text-anchor="middle" class="svg-mono">T₂</text>
+    <text x="340" y="76" text-anchor="middle" class="svg-small">≥ h + 3</text>
+  </g>
+  <g>
+    <rect x="510" y="30" width="150" height="62" rx="8" class="svg-box"/>
+    <text x="585" y="56" text-anchor="middle" class="svg-mono">T₃</text>
+    <text x="585" y="76" text-anchor="middle" class="svg-small">≥ h + 6</text>
+  </g>
+  <path d="M170 61 H262" class="svg-line" marker-end="url(#arr)"/>
+  <path d="M415 61 H507" class="svg-line" marker-end="url(#arr)"/>
+  <text x="216" y="52" text-anchor="middle" class="svg-small">covenant</text>
+  <text x="461" y="52" text-anchor="middle" class="svg-small">covenant</text>
+  <!-- children -->
+  <g>
+    <rect x="20" y="150" width="150" height="62" rx="8" class="svg-accent"/>
+    <text x="95" y="176" text-anchor="middle" class="svg-text">builder's child</text>
+    <text x="95" y="196" text-anchor="middle" class="svg-mono">OP_RETURN block 1</text>
+  </g>
+  <g>
+    <rect x="265" y="150" width="150" height="62" rx="8" class="svg-accent"/>
+    <text x="340" y="176" text-anchor="middle" class="svg-text">builder's child</text>
+    <text x="340" y="196" text-anchor="middle" class="svg-mono">OP_RETURN block 2</text>
+  </g>
+  <g>
+    <rect x="510" y="150" width="150" height="62" rx="8" class="svg-box" stroke-dasharray="5 4"/>
+    <text x="585" y="176" text-anchor="middle" class="svg-text">no child</text>
+    <text x="585" y="196" text-anchor="middle" class="svg-small">waits in the mempool</text>
+  </g>
+  <path d="M95 92 V147" class="svg-accent-line" marker-end="url(#arr-acc)"/>
+  <path d="M340 92 V147" class="svg-accent-line" marker-end="url(#arr-acc)"/>
+  <path d="M585 92 V147" class="svg-line" stroke-dasharray="4 4"/>
+  <text x="103" y="124" class="svg-small">P2A, pays fee for both</text>
+  <text x="348" y="124" class="svg-small">P2A, pays fee for both</text>
+</svg>
+<figcaption>Each covenant output has a 3-block relative timelock, so <code>T<sub>i+1</sub></code> can confirm only 3 Bitcoin blocks after <code>T<sub>i</sub></code>. There's at most one anchor, and so one namespace block, every 3 Bitcoin blocks: about 30 minutes.</figcaption>
+</figure>
+
+<p>Covenant transactions are TRUC (version 3), and their P2A output is ephemeral dust, so they relay only as a package with a child that spends it. Builders compete for a slot by replacing each other's child with one that pays more.</p>
+<p>Every rule counts <em>namespace</em> block heights, not Bitcoin heights, so a block is valid or invalid no matter which Bitcoin block its anchor lands in.</p>
+</section>
+
+<section id="builders">
+<h2><span class="num">3</span>Builders</h2>
+<p>A builder takes transactions from its node's mempool, assembles the next block, signs it, and anchors it. Each block header names the builder's BIP340 key, and the block carries the builder's signature over the header hash. A block with a bad signature is invalid. A node keeps its builder key in <code>builder.key</code> in its data directory.</p>
+<p>The chain has no fees, so nothing on it pays builders. Users pay a builder some other way, outside the protocol: over Lightning, say, or with a Bitcoin payment. Builders spend what they collect on the Bitcoin fee for their anchor. The highest-paying child gets the slot, so a builder that collects more can outbid the others.</p>
+<div class="callout"><p>Getting a block anchored is the only scarce thing a builder has. Whoever wins a slot decides what goes into that namespace block, including which free names it announces (see <a href="#announcements">announcements</a>).</p></div>
+</section>
+
+<section id="forks">
+<h2><span class="num">4</span>Fork choice</h2>
+<p>Bitcoin orders the anchors, but each header names its own parent, so anchored blocks form a tree rooted at genesis. A block is <strong>eligible</strong> when:</p>
+<ul>
+  <li>it is anchored, and its first anchor comes after its parent's,</li>
+  <li>its body is known and its height is one more than its parent's,</li>
+  <li>it has been checked and is valid, and</li>
+  <li>its parent is genesis or eligible.</li>
+</ul>
+<p>The tip is the highest eligible block. Ties go to the block anchored first.</p>
+<p>If a builder anchors a block but never publishes its body, that block isn't eligible, so the chain stalls there. Other builders get past it by anchoring blocks on its parent. Once that branch is longer, the withheld block is orphaned. A Bitcoin reorg undoes the anchors it removes and the namespace blocks built on them, and their transactions go back to the mempool.</p>
+</section>
+
+<section id="names">
+<h2><span class="num">5</span>Names</h2>
+<p>A name record holds the owner key, the height it was registered at, the height it expires at, and a sequence number.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Transaction</th><th>Who sends it</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>Announce</code></td><td>anyone; the block's builder owns it</td><td>Opens a free name. The announcement belongs to the builder of the block it is in.</td></tr>
+    <tr><td><code>Register</code></td><td>anyone; only the announcing builder can include it</td><td>Gives an announced name to an owner key.</td></tr>
+    <tr><td><code>Renew</code></td><td>owner, signed</td><td>Moves expiry to <code>expiry_period</code> blocks from now.</td></tr>
+    <tr><td><code>Transfer</code></td><td>owner, signed</td><td>Moves the name to a new owner key.</td></tr>
+  </tbody>
+</table></div>
+<p>Renewals and transfers are Schnorr-signed over <code>(name, registered_at, seq)</code>. <code>seq</code> goes up with each one, so a signature can't be replayed. <code>registered_at</code> ties a signature to one registration, so an old owner's signature stops working if the name expires and someone registers it again.</p>
+<p>A name expires <code>expiry_period</code> (52,560) blocks, about three years, after it was registered or last renewed. An expired name has to be announced again before anyone can register it.</p>
+</section>
+
+<section id="announcements">
+<h2><span class="num">6</span>Announcements</h2>
+<p>Every registration starts with an announcement, and the announcement belongs to the builder of the block it is in. Only that builder can register the name, and it gets exactly one chance:</p>
+<ol class="steps">
+  <li>The name is announced in a block at height <code>a</code>, built by builder B.</li>
+  <li>Until <code>a + announce_delay</code>, no one can register it. B's blocks in this period don't count.</li>
+  <li>B's <strong>first block</strong> at or after <code>a + announce_delay</code> can register it to any owner. Blocks by other builders don't use up B's chance.</li>
+  <li>If that block doesn't register it, the announcement <strong>lapses</strong> and can't be registered.</li>
+  <li>At <code>a + 2 × announce_delay</code> an unregistered announcement is <strong>released</strong>, and anyone can announce the name again.</li>
+</ol>
+
+<figure>
+<svg viewBox="0 0 680 170" role="img" aria-labelledby="tl-title">
+  <title id="tl-title">Timeline of an announcement: a waiting period, then the announcing builder's first block, then release at twice the delay</title>
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="svg-arrow"/></marker>
+  </defs>
+  <rect x="70" y="58" width="270" height="34" class="svg-box"/>
+  <rect x="340" y="58" width="270" height="34" class="svg-accent"/>
+  <text x="205" y="80" text-anchor="middle" class="svg-text">waiting: no registrations</text>
+  <text x="475" y="80" text-anchor="middle" class="svg-text">B's first block may register it</text>
+  <path d="M70 92 V108 M340 92 V108 M610 92 V108" class="svg-line"/>
+  <text x="70" y="126" text-anchor="middle" class="svg-mono">a</text>
+  <text x="340" y="126" text-anchor="middle" class="svg-mono">a + 336</text>
+  <text x="610" y="126" text-anchor="middle" class="svg-mono">a + 672</text>
+  <text x="70" y="145" text-anchor="middle" class="svg-small">announced by B</text>
+  <text x="340" y="145" text-anchor="middle" class="svg-small">opens (~1 week)</text>
+  <text x="610" y="145" text-anchor="middle" class="svg-small">released (~2 weeks)</text>
+  <path d="M400 40 V56" class="svg-accent-line"/>
+  <circle cx="400" cy="36" r="5" class="svg-bar"/>
+  <text x="400" y="22" text-anchor="middle" class="svg-small">B's first block: registers it, or the announcement lapses</text>
+</svg>
+<figcaption>Heights are namespace blocks. With one block every 3 Bitcoin blocks, <code>announce_delay</code> = 336 is about a week.</figcaption>
+</figure>
+
+<h3>Why it works this way</h3>
+<p>A Bitcoin anchor buys a whole block, so builders bid on the total value of everything in it. If any builder could register any announced name, a builder that wins a slot thanks to a valuable name like <code>bob</code> could also take <code>oooop</code>, even though someone else bid more for <code>oooop</code> through a different builder. Tying each name to its announcing builder means a slot won on one name can't take names other builders announced.</p>
+<p>So the contest for a name happens when it's announced: whoever wins a slot while a name is free can claim it, up to the <a href="#tiers">tier caps</a>. Users who want that name then buy it from the announcing builder.</p>
+<p>The mempool accepts a registration as long as its announcing builder could include it, so other nodes relay it on to that builder.</p>
+</section>
+
+<section id="tiers">
+<h2><span class="num">7</span>Announcement tiers</h2>
+<p>Announcements are rate-limited, and shorter names open later. A name's <strong>tier</strong> is how many characters shorter than 10 it is: names of 10 or more characters are tier 0, 9 characters is tier 1, and 1 character is tier 9.</p>
+<p>Every tier ramps up the same way, moving to the next stage every <code>stage_length</code> (4,380) blocks, about three months:</p>
+
+<figure>
+<svg viewBox="0 0 680 210" role="img" aria-labelledby="ramp-title">
+  <title id="ramp-title">Stages of a tier: 1 announcement every 9 blocks, every 3, then 1, 3, 9 and 16 per block</title>
+  <!-- log-ish bars -->
+  <g>
+    <rect x="40"  y="160" width="80" height="10"  class="svg-bar-soft"/>
+    <rect x="145" y="150" width="80" height="20"  class="svg-bar-soft"/>
+    <rect x="250" y="135" width="80" height="35"  class="svg-bar"/>
+    <rect x="355" y="110" width="80" height="60"  class="svg-bar"/>
+    <rect x="460" y="70"  width="80" height="100" class="svg-bar"/>
+    <rect x="565" y="40"  width="80" height="130" class="svg-bar"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="80"  y="152" class="svg-text">1 / 9 blocks</text>
+    <text x="185" y="142" class="svg-text">1 / 3 blocks</text>
+    <text x="290" y="127" class="svg-text">1 / block</text>
+    <text x="395" y="102" class="svg-text">3 / block</text>
+    <text x="500" y="62"  class="svg-text">9 / block</text>
+    <text x="605" y="32"  class="svg-text">16 / block</text>
+    <text x="80"  y="190" class="svg-small">stage 0</text>
+    <text x="185" y="190" class="svg-small">stage 1</text>
+    <text x="290" y="190" class="svg-small">stage 2</text>
+    <text x="395" y="190" class="svg-small">stage 3</text>
+    <text x="500" y="190" class="svg-small">stage 4</text>
+    <text x="605" y="190" class="svg-small">stage 5: cap</text>
+  </g>
+  <path d="M30 170 H655" class="svg-line"/>
+</svg>
+<figcaption>Below one per block, a stage allows one announcement in blocks whose height is a multiple of 9 or 3. Bars aren't to scale.</figcaption>
+</figure>
+
+<p>When a tier reaches 16 per block, the next tier opens. Tier 0 starts at stage 3, so it allows 3 per block at launch. Each tier takes six stages, about 18 months, to reach its cap:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Tier</th><th>Name length</th><th>Opens after</th></tr></thead>
+  <tbody>
+    <tr><td class="n">0</td><td class="n">10+</td><td>launch, at 3 per block</td></tr>
+    <tr><td class="n">1</td><td class="n">9</td><td>~9 months</td></tr>
+    <tr><td class="n">2</td><td class="n">8</td><td>~2¼ years</td></tr>
+    <tr><td class="n">3</td><td class="n">7</td><td>~3¾ years</td></tr>
+    <tr><td class="n">4</td><td class="n">6</td><td>~5¼ years</td></tr>
+    <tr><td class="n">5</td><td class="n">5</td><td>~6¾ years</td></tr>
+    <tr><td class="n">6</td><td class="n">4</td><td>~8¼ years</td></tr>
+    <tr><td class="n">7</td><td class="n">3</td><td>~9¾ years</td></tr>
+    <tr><td class="n">8</td><td class="n">2</td><td>~11¼ years</td></tr>
+    <tr><td class="n">9</td><td class="n">1</td><td>~12¾ years</td></tr>
+  </tbody>
+</table></div>
+<p>The caps limit how many names a slot's builder can claim. That matters most while a tier is opening, when its best names are still free and the tier allows only one announcement every few blocks. Registrations have no cap of their own, since each one needs an announcement. A block can hold at most <code>max_txs_per_block</code> transactions of any kind.</p>
+</section>
+
+<section id="state">
+<h2><span class="num">8</span>State commitment &amp; proofs</h2>
+<p>Each header carries a <code>state_root</code>: the root of a sparse Merkle tree over every name record and pending announcement after the block. A block whose root doesn't match the state it produces is invalid.</p>
+<p>Given a header, anyone can check a proof that a name has a given record, or has none:</p>
+<pre><code>GET /proof/&lt;name&gt;     # record + Merkle proof against the tip's state_root
+ns proof alice         # fetches and verifies it</code></pre>
+<p>A node snapshots the state every 1,000 blocks and on shutdown. On startup it loads the newest snapshot that's on the best chain and matches its block's <code>state_root</code>, then replays from there. A reorg deeper than the snapshot falls back to replaying from genesis.</p>
+</section>
+
+<section id="params">
+<h2><span class="num">9</span>Parameters</h2>
+<p>Mainnet values, from <code>Params::mainnet()</code> in <code>crates/core/src/params.rs</code>. Durations assume one namespace block every 3 Bitcoin blocks.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Parameter</th><th>Value</th><th>About</th></tr></thead>
+  <tbody>
+    <tr><td><code>COVENANT_DELAY</code></td><td class="n">3</td><td>Bitcoin blocks between anchors</td></tr>
+    <tr><td><code>announce_delay</code></td><td class="n">336</td><td>1 week until an announced name opens; released after 2 weeks</td></tr>
+    <tr><td><code>expiry_period</code></td><td class="n">52,560</td><td>3 years</td></tr>
+    <tr><td><code>stage_length</code></td><td class="n">4,380</td><td>3 months per ramp stage</td></tr>
+    <tr><td><code>long_name_len</code></td><td class="n">10</td><td>names this long or longer are tier 0</td></tr>
+    <tr><td><code>ramp_factor</code></td><td class="n">3</td><td>each stage allows 3× the last</td></tr>
+    <tr><td><code>ramp_slow_stages</code></td><td class="n">2</td><td>stages below 1 per block</td></tr>
+    <tr><td><code>max_announcements_per_tier</code></td><td class="n">16</td><td>per tier, per block</td></tr>
+    <tr><td><code>max_txs_per_block</code></td><td class="n">20,000</td><td>all transactions</td></tr>
+  </tbody>
+</table></div>
+</section>
+
+<section id="running">
+<h2><span class="num">10</span>Running it</h2>
+<p>The code is three Rust crates. <code>core</code> holds the consensus rules and does no IO. <code>node</code> is <code>namespaced</code>: it follows Bitcoin, stores blocks, talks to peers over iroh, and serves a local HTTP API. <code>cli</code> is <code>ns</code>, the wallet and builder tool.</p>
+<pre><code># Once per chain: make the covenant.
+ns covenant keygen --key-out cov.key --network regtest   # prints an address; fund it
+ns covenant sign --key cov.key --funding &lt;txid&gt;:&lt;vout&gt; --amount &lt;sats&gt; \
+  --count 10000 --out covenant.json                       # deletes cov.key
+
+namespaced --network regtest \
+  --bitcoin-backend esplora --bitcoin-url http://localhost:3000 \
+  --covenant-start &lt;txid&gt;:&lt;vout&gt; --covenant-start-height &lt;h&gt;
+
+ns keygen
+ns announce alice    # owned by the builder whose block includes it
+ns register alice    # that builder can include it announce_delay blocks later
+ns lookup alice
+ns proof alice
+
+# Builders: build a block and anchor it.
+ns anchor --chain covenant.json --network regtest --fee-rate 2 \
+  --utxo &lt;txid&gt;:&lt;vout&gt; --utxo-amount &lt;sats&gt; --utxo-address &lt;addr&gt; --change &lt;addr&gt;
+bitcoin-cli walletprocesspsbt &lt;psbt&gt;
+ns finalize &lt;signed psbt&gt;
+bitcoin-cli submitpackage '["&lt;covenant tx&gt;", "&lt;child&gt;"]'</code></pre>
+</section>
+
+<section id="open">
+<h2><span class="num">11</span>Open problems</h2>
+<p>These are known weaknesses of the current design, not yet solved:</p>
+<ul>
+  <li><strong>Builders are trusted with payments.</strong> A payment to a builder can't depend on what ends up in a namespace block, because Bitcoin can't see namespace state. A builder can take payment and then not register the name, or register it to someone else.</li>
+  <li><strong>Picks from different tiers share a block.</strong> One slot can allow announcements in several tiers at once, so a single fee bid covers all of them. Once every tier is at its cap, a slot can claim up to 160 names.</li>
+  <li><strong>Builders can hold names.</strong> After a release, the same builder can announce the name again, under a new key if it wants. Each re-announcement uses one of the tier's announcement slots, which is expensive while a tier is opening and cheap once it's at its cap.</li>
+  <li><strong>Bitcoin miners get the last look.</strong> The miner who finds a block sees every competing child and can anchor its own block instead, giving up only the best fee it skipped.</li>
+  <li><strong>No light client yet.</strong> Proofs are checked against a header from a node. A client that follows headers through their Bitcoin anchors alone couldn't tell whether a block is valid, because eligibility depends on the block's contents.</li>
+</ul>
+</section>
+
+<footer>
+  Source and issues on <a href="https://github.com/caulifluoride/namespace">GitHub</a>. This page describes the code as of its last deploy.
+</footer>
+
+</main>
+</body>
+</html>
