@@ -138,17 +138,18 @@ mod tests {
 
     use super::*;
     use crate::hash::Hash256;
+    use crate::name::Name;
     use crate::tx::Tx;
 
-    /// Distinct blocks on top of `parent`, made unique by a dummy commit.
+    /// Distinct blocks on top of `parent`, made unique by a dummy announcement.
     fn child(parent: &Block, tag: u8) -> Block {
-        let commit = Tx::Commit {
-            commitment: Hash256([tag; 32]),
+        let announce = Tx::Announce {
+            name: Name::new(&format!("n{tag}")).unwrap(),
         };
         Block::new(
             parent.hash(),
             parent.header.height,
-            vec![commit],
+            vec![announce],
             Hash256::ZERO,
         )
     }

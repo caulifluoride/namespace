@@ -7,10 +7,11 @@
 //! - output 0, the covenant output: the same amount, to the same key, and
 //! - output 1, a zero-value pay-to-anchor (P2A) output anyone can spend.
 //!
-//! The input's `nSequence` is a one-block relative timelock (BIP68 applies to
-//! every transaction version 2 and up), so at most one `T_i` confirms per
-//! Bitcoin block. All of them are signed up front and the key is deleted, so
-//! `T_i` is the only possible spend of `T_{i-1}`'s covenant output.
+//! The input's `nSequence` is a relative timelock of `COVENANT_DELAY` blocks
+//! (BIP68 applies to every transaction version 2 and up), so at most one `T_i`
+//! confirms every `COVENANT_DELAY` Bitcoin blocks. All of them are signed up
+//! front and the key is deleted, so `T_i` is the only possible spend of
+//! `T_{i-1}`'s covenant output.
 //!
 //! `T_i` pays no fee and its P2A output is dust, so it relays only as a
 //! package with a child that spends the P2A output (ephemeral dust). The
@@ -26,6 +27,7 @@ use bitcoin::{
     Amount, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType, Transaction, TxIn, TxOut, Witness,
     absolute, taproot,
 };
+use namespace_core::anchor::COVENANT_DELAY;
 use serde::{Deserialize, Serialize};
 
 pub const COVENANT_VOUT: u32 = 0;
@@ -92,7 +94,7 @@ pub fn generate<C: Signing + Verification>(
             input: vec![TxIn {
                 previous_output: prev,
                 script_sig: ScriptBuf::new(),
-                sequence: Sequence::from_height(1),
+                sequence: Sequence::from_height(COVENANT_DELAY),
                 witness: Witness::new(),
             }],
             output: vec![
@@ -309,7 +311,7 @@ mod tests {
         let mut prev = funding;
         for tx in &txs {
             assert_eq!(tx.input[0].previous_output, prev);
-            assert_eq!(tx.input[0].sequence, Sequence::from_height(1));
+            assert_eq!(tx.input[0].sequence, Sequence::from_height(COVENANT_DELAY));
             assert_eq!(tx.output[0], prevout);
             assert!(is_p2a(&tx.output[1].script_pubkey));
             verify(tx, &prevout);

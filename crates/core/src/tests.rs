@@ -8,7 +8,7 @@ use crate::hash::Hash256;
 use crate::name::Name;
 use crate::params::{Params, TierRate};
 use crate::state::{BlockBuilder, BlockError, NameProof, State, TxError, Undo};
-use crate::tx::{OwnerKey, SignedOp, Tx, commitment_hash, sighash, sign};
+use crate::tx::{OwnerKey, SignedOp, Tx, sighash, sign};
 
 struct Harness {
     state: State,
@@ -30,6 +30,17 @@ fn owner(kp: &Keypair) -> OwnerKey {
 
 fn name(s: &str) -> Name {
     Name::new(s).unwrap()
+}
+
+fn announce(n: &str) -> Tx {
+    Tx::Announce { name: name(n) }
+}
+
+fn register(n: &str, kp: &Keypair) -> Tx {
+    Tx::Register {
+        name: name(n),
+        owner: owner(kp),
+    }
 }
 
 impl Harness {
@@ -65,18 +76,11 @@ impl Harness {
         }
     }
 
-    /// Commits, waits out the minimum age, and registers.
+    /// Announces, waits out the delay, and registers.
     fn register(&mut self, n: &str, kp: &Keypair) {
-        let salt = Hash256([7; 32]);
-        let commitment = commitment_hash(&name(n), &owner(kp), &salt);
-        self.apply(vec![Tx::Commit { commitment }]).unwrap();
-        self.empty_blocks(self.params.min_commit_age - 1);
-        self.apply(vec![Tx::Register {
-            name: name(n),
-            owner: owner(kp),
-            salt,
-        }])
-        .unwrap();
+        self.apply(vec![announce(n)]).unwrap();
+        self.empty_blocks(self.params.announce_delay - 1);
+        self.apply(vec![register(n, kp)]).unwrap();
     }
 
     fn renew_tx(&self, n: &str, kp: &Keypair) -> Tx {
@@ -110,98 +114,82 @@ fn tx_error(r: Result<(), BlockError>) -> TxError {
 }
 
 #[test]
-fn commit_then_register() {
+fn announce_then_register() {
     let mut h = Harness::new();
     let alice = keypair(1);
     h.register("alice", &alice);
     let rec = h.state.lookup(&name("alice")).unwrap();
     assert_eq!(rec.owner, owner(&alice));
     assert_eq!(rec.seq, 0);
+    assert_eq!(h.state.announced_at(&name("alice")), None);
 }
 
 #[test]
-fn reveal_in_same_block_as_commit_is_rejected() {
+fn register_waits_for_announce_delay() {
     let mut h = Harness::new();
     let alice = keypair(1);
-    let salt = Hash256([7; 32]);
-    let commitment = commitment_hash(&name("alice"), &owner(&alice), &salt);
-    let r = h.apply(vec![
-        Tx::Commit { commitment },
-        Tx::Register {
-            name: name("alice"),
-            owner: owner(&alice),
-            salt,
-        },
-    ]);
-    assert_eq!(tx_error(r), TxError::CommitmentTooRecent(2));
+    h.apply(vec![announce("alice")]).unwrap();
+    // Announced at 1, so it opens at 1 + announce_delay.
+    let opens_at = 1 + h.params.announce_delay;
+    let r = h.apply(vec![register("alice", &alice)]);
+    assert_eq!(tx_error(r), TxError::AnnouncementTooRecent(opens_at));
+    h.empty_blocks(opens_at - h.state.height() - 1);
+    h.apply(vec![register("alice", &alice)]).unwrap();
+    assert_eq!(h.state.height(), opens_at);
 }
 
 #[test]
-fn register_without_commit_or_with_wrong_salt() {
+fn register_without_announcement() {
     let mut h = Harness::new();
-    let alice = keypair(1);
-    let commitment = commitment_hash(&name("alice"), &owner(&alice), &Hash256([7; 32]));
-    h.apply(vec![Tx::Commit { commitment }]).unwrap();
-    let r = h.apply(vec![Tx::Register {
-        name: name("alice"),
-        owner: owner(&alice),
-        salt: Hash256([8; 32]),
-    }]);
-    assert_eq!(tx_error(r), TxError::NoCommitment);
+    let r = h.apply(vec![register("alice", &keypair(1))]);
+    assert_eq!(tx_error(r), TxError::NotAnnounced);
 }
 
 #[test]
-fn taken_name_cannot_be_registered_until_expiry() {
+fn first_registration_wins() {
+    let mut h = Harness::new();
+    let (alice, bob) = (keypair(1), keypair(2));
+    h.apply(vec![announce("alice")]).unwrap();
+    h.empty_blocks(h.params.announce_delay - 1);
+    let r = h.apply(vec![register("alice", &bob), register("alice", &alice)]);
+    assert_eq!(tx_error(r), TxError::NotAnnounced);
+    h.apply(vec![register("alice", &bob)]).unwrap();
+    assert_eq!(h.state.lookup(&name("alice")).unwrap().owner, owner(&bob));
+    let r = h.apply(vec![register("alice", &alice)]);
+    assert_eq!(tx_error(r), TxError::NotAnnounced);
+}
+
+#[test]
+fn duplicate_announcement_rejected() {
+    let mut h = Harness::new();
+    h.apply(vec![announce("alice")]).unwrap();
+    assert_eq!(
+        tx_error(h.apply(vec![announce("alice")])),
+        TxError::AlreadyAnnounced
+    );
+}
+
+#[test]
+fn taken_name_cannot_be_announced_until_expiry() {
     let mut h = Harness::new();
     let (alice, bob) = (keypair(1), keypair(2));
     h.register("alice", &alice);
+    assert_eq!(
+        tx_error(h.apply(vec![announce("alice")])),
+        TxError::NameTaken
+    );
 
-    let salt = Hash256([9; 32]);
-    let commitment = commitment_hash(&name("alice"), &owner(&bob), &salt);
-    h.apply(vec![Tx::Commit { commitment }]).unwrap();
-    let steal = Tx::Register {
-        name: name("alice"),
-        owner: owner(&bob),
-        salt,
-    };
-    assert_eq!(tx_error(h.apply(vec![steal.clone()])), TxError::NameTaken);
-
-    // Let alice's registration lapse. Bob's commitment would have expired by
-    // then, so he commits again.
     let expires = h.state.lookup(&name("alice")).unwrap().expires_at;
     h.empty_blocks(expires - h.state.height() - 1);
     assert!(h.state.lookup(&name("alice")).is_some());
     h.empty_blocks(1);
     assert!(h.state.lookup(&name("alice")).is_none());
-    assert_eq!(h.state.commitment_height(&commitment), None);
 
+    // Expired, but it has to be announced again before anyone can register it.
+    let r = h.apply(vec![register("alice", &bob)]);
+    assert_eq!(tx_error(r), TxError::NotAnnounced);
     h.register("alice", &bob);
     assert_eq!(h.state.lookup(&name("alice")).unwrap().owner, owner(&bob));
-}
-
-#[test]
-fn commitments_expire() {
-    let mut h = Harness::new();
-    let alice = keypair(1);
-    let salt = Hash256([7; 32]);
-    let commitment = commitment_hash(&name("alice"), &owner(&alice), &salt);
-    h.apply(vec![Tx::Commit { commitment }]).unwrap();
-    // Revealable up to height 1 + max_commit_age.
-    h.empty_blocks(h.params.max_commit_age);
-    assert_eq!(h.state.commitment_height(&commitment), Some(1));
-    h.empty_blocks(1);
-    assert_eq!(h.state.commitment_height(&commitment), None);
-}
-
-#[test]
-fn duplicate_commitment_rejected() {
-    let mut h = Harness::new();
-    let commitment = Hash256([1; 32]);
-    h.apply(vec![Tx::Commit { commitment }]).unwrap();
-    assert_eq!(
-        tx_error(h.apply(vec![Tx::Commit { commitment }])),
-        TxError::DuplicateCommitment
-    );
 }
 
 #[test]
@@ -263,36 +251,27 @@ fn signatures_do_not_survive_reregistration() {
 }
 
 #[test]
-fn registration_cap_enforced() {
+fn announcement_cap_enforced() {
     let mut h = Harness::new();
-    let kp = keypair(1);
-    let salt = Hash256([7; 32]);
     let names = ["a", "b", "c", "d"];
-    let commits = names
-        .iter()
-        .map(|n| Tx::Commit {
-            commitment: commitment_hash(&name(n), &owner(&kp), &salt),
-        })
-        .collect();
-    h.apply(commits).unwrap();
-    let regs: Vec<_> = names
-        .iter()
-        .map(|n| Tx::Register {
-            name: name(n),
-            owner: owner(&kp),
-            salt,
-        })
-        .collect();
+    let announces: Vec<_> = names.iter().map(|n| announce(n)).collect();
     // Regtest has one tier, at 3 per block in the first stage.
     assert_eq!(
-        h.apply(regs.clone()),
+        h.apply(announces.clone()),
         Err(BlockError::TierLimit {
             lengths: "1+".into(),
             count: 4,
             cap: 3
         })
     );
-    h.apply(regs[..3].to_vec()).unwrap();
+    h.apply(announces[..3].to_vec()).unwrap();
+    h.apply(announces[3..].to_vec()).unwrap();
+
+    // Registrations have no cap of their own.
+    h.empty_blocks(h.params.announce_delay - 1);
+    let kp = keypair(1);
+    h.apply(names.iter().map(|n| register(n, &kp)).collect())
+        .unwrap();
 }
 
 #[test]
@@ -329,31 +308,18 @@ fn revert_restores_previous_state() {
 
 #[test]
 fn builder_skips_invalid_and_overflowing_txs() {
-    let mut h = Harness::new();
-    let kp = keypair(1);
-    let salt = Hash256([7; 32]);
-    let commits: Vec<_> = ["a", "b", "c", "d"]
-        .iter()
-        .map(|n| Tx::Commit {
-            commitment: commitment_hash(&name(n), &owner(&kp), &salt),
-        })
-        .collect();
-    h.apply(commits).unwrap();
-
+    let h = Harness::new();
     let mut builder = BlockBuilder::new(&h.state, &h.params, &h.secp);
     for n in ["a", "a", "b", "c", "d"] {
-        let _ = builder.try_add(Tx::Register {
-            name: name(n),
-            owner: owner(&kp),
-            salt,
-        });
+        let _ = builder.try_add(announce(n));
     }
     let block = builder.finish();
-    // The second "a" has no commitment left; "d" exceeds the cap of 3.
+    // The second "a" is already announced; "d" exceeds the cap of 3.
     assert_eq!(block.txs.len(), 3);
-    h.state.apply_block(&block, &h.params, &h.secp).unwrap();
-    assert!(h.state.lookup(&name("c")).is_some());
-    assert!(h.state.lookup(&name("d")).is_none());
+    let mut state = h.state.clone();
+    state.apply_block(&block, &h.params, &h.secp).unwrap();
+    assert!(state.announced_at(&name("c")).is_some());
+    assert!(state.announced_at(&name("d")).is_none());
 }
 
 #[test]
@@ -362,14 +328,8 @@ fn encoding_roundtrip() {
     let mut h = Harness::new();
     h.register("alice", &alice);
     let txs = vec![
-        Tx::Commit {
-            commitment: Hash256([3; 32]),
-        },
-        Tx::Register {
-            name: name("x"),
-            owner: owner(&alice),
-            salt: Hash256([4; 32]),
-        },
+        announce("x"),
+        register("y", &alice),
         h.renew_tx("alice", &alice),
         h.transfer_tx("alice", &alice, owner(&keypair(2))),
     ];
@@ -385,9 +345,7 @@ fn encoding_roundtrip() {
 #[test]
 fn wrong_state_root_rejected() {
     let mut h = Harness::new();
-    let mut block = h.block(vec![Tx::Commit {
-        commitment: Hash256([1; 32]),
-    }]);
+    let mut block = h.block(vec![announce("alice")]);
     let before = format!("{:?}", h.state);
     block.header.state_root = Hash256::ZERO;
     assert_eq!(
@@ -418,10 +376,7 @@ fn name_proofs() {
     let mut h = Harness::new();
     let alice = keypair(1);
     h.register("alice", &alice);
-    h.apply(vec![Tx::Commit {
-        commitment: Hash256([1; 32]),
-    }])
-    .unwrap();
+    h.apply(vec![announce("carol")]).unwrap();
     let root = h.state.state_root();
 
     let proof = h.state.prove_name(&name("alice"));
@@ -449,10 +404,7 @@ fn snapshot_roundtrip() {
     let mut h = Harness::new();
     let alice = keypair(1);
     h.register("alice", &alice);
-    h.apply(vec![Tx::Commit {
-        commitment: Hash256([1; 32]),
-    }])
-    .unwrap();
+    h.apply(vec![announce("carol")]).unwrap();
     let bytes = h.state.to_bytes();
     let restored = State::from_bytes(&bytes).unwrap();
     assert_eq!(format!("{restored:?}"), format!("{:?}", h.state));
@@ -468,7 +420,8 @@ fn snapshot_roundtrip() {
 #[test]
 fn short_names_wait_for_their_tier() {
     let mut h = Harness::new();
-    // Tier 0 is 5+ characters; "bob" is tier 2, which opens at height 10.
+    // Tier 0 is 5+ characters; "bob" is tier 2, which can be announced from
+    // height 10.
     h.params = Params {
         long_name_len: 5,
         stage_length: 1,
@@ -478,16 +431,8 @@ fn short_names_wait_for_their_tier() {
     let kp = keypair(1);
     h.register("alice", &kp);
 
-    let salt = Hash256([7; 32]);
-    let commitment = commitment_hash(&name("bob"), &owner(&kp), &salt);
-    h.apply(vec![Tx::Commit { commitment }]).unwrap();
-    let reg = Tx::Register {
-        name: name("bob"),
-        owner: owner(&kp),
-        salt,
-    };
     assert_eq!(
-        h.apply(vec![reg.clone()]),
+        h.apply(vec![announce("bob")]),
         Err(BlockError::TierLimit {
             lengths: "3".into(),
             count: 1,
@@ -499,6 +444,6 @@ fn short_names_wait_for_their_tier() {
     assert_eq!(h.params.tier_rate(10, 2), TierRate::Every { blocks: 9 });
     assert_eq!(h.params.tier_rate(12, 2), TierRate::PerBlock { count: 1 });
     h.empty_blocks(11 - h.state.height());
-    h.apply(vec![reg]).unwrap();
-    assert!(h.state.lookup(&name("bob")).is_some());
+    h.apply(vec![announce("bob")]).unwrap();
+    assert_eq!(h.state.announced_at(&name("bob")), Some(12));
 }

@@ -12,8 +12,9 @@
 //! spends `T_i`'s anchor output, pays the Bitcoin fee for both by CPFP, and
 //! carries `OP_RETURN <MAGIC> <block hash>`. Only one child can spend the
 //! anchor output, so at most one namespace block is anchored per covenant
-//! transaction. A relative timelock on the covenant inputs limits it to one
-//! covenant transaction per Bitcoin block. Bitcoin miners pick the
+//! transaction. A relative timelock of [`COVENANT_DELAY`] blocks on the
+//! covenant inputs limits it to one covenant transaction every
+//! `COVENANT_DELAY` Bitcoin blocks. Bitcoin miners pick the
 //! highest-paying child without having to know anything about the namespace.
 
 use bitcoin::opcodes::all::OP_RETURN;
@@ -26,6 +27,11 @@ use crate::hash::Hash256;
 
 /// Identifies namespace anchors among other OP_RETURN outputs.
 pub const MAGIC: [u8; 4] = *b"NSPC";
+
+/// Relative timelock, in Bitcoin blocks, on each covenant transaction's input:
+/// a covenant transaction can confirm only this many blocks after the one
+/// before it.
+pub const COVENANT_DELAY: u16 = 3;
 
 /// Where the covenant chain lives on Bitcoin.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,7 +157,7 @@ mod tests {
                 .map(|&previous_output| TxIn {
                     previous_output,
                     script_sig: ScriptBuf::new(),
-                    sequence: Sequence::from_height(1),
+                    sequence: Sequence::from_height(COVENANT_DELAY),
                     witness: Witness::new(),
                 })
                 .collect(),

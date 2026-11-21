@@ -20,7 +20,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/status", get(status))
         .route("/name/{name}", get(name))
         .route("/proof/{name}", get(proof))
-        .route("/commitment/{hash}", get(commitment))
+        .route("/announcement/{name}", get(announcement))
         .route("/block/{hash}", get(block))
         .route("/tx", post(submit_tx))
         .route("/build", post(build))
@@ -44,8 +44,8 @@ pub struct Status {
     pub missing_bodies: usize,
     pub endpoint_id: String,
     pub peers: usize,
-    /// What each name length can register in the next block.
-    pub registrations: Vec<TierStatus>,
+    /// How many names of each length can be announced in the next block.
+    pub announcements: Vec<TierStatus>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,7 +69,7 @@ async fn status(State(node): AppState) -> Json<Status> {
         missing_bodies: chain.missing_bodies().len(),
         endpoint_id: node.endpoint.id().to_string(),
         peers: node.peer_count(),
-        registrations: (0..chain.params().tiers())
+        announcements: (0..chain.params().tiers())
             .map(|t| TierStatus {
                 lengths: chain.params().tier_lengths(t),
                 rate: chain.params().tier_rate(state.height() + 1, t),
@@ -119,18 +119,27 @@ async fn proof(
     }))
 }
 
-async fn commitment(
+#[derive(Serialize, Deserialize)]
+pub struct Announcement {
+    pub announced_at: u64,
+    /// The first height a registration of the name can be in.
+    pub opens_at: u64,
+}
+
+async fn announcement(
     State(node): AppState,
-    Path(hash): Path<String>,
-) -> Result<Json<u64>, Response> {
-    let hash: Hash256 = hash
-        .parse()
-        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
-    node.chain()
+    Path(name): Path<String>,
+) -> Result<Json<Announcement>, Response> {
+    let name = Name::new(&name).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    let chain = node.chain();
+    let announced_at = chain
         .state()
-        .commitment_height(&hash)
-        .map(Json)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "no such commitment"))
+        .announced_at(&name)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "name not announced"))?;
+    Ok(Json(Announcement {
+        announced_at,
+        opens_at: announced_at + chain.params().announce_delay,
+    }))
 }
 
 async fn block(State(node): AppState, Path(hash): Path<String>) -> Result<Json<Block>, Response> {

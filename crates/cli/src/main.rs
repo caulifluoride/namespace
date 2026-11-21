@@ -4,7 +4,6 @@
 
 mod covenant;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -12,7 +11,7 @@ use bitcoin::address::NetworkUnchecked;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, rand};
 use bitcoin::{Address, Amount, Network, OutPoint, Psbt, ScriptBuf, TxOut};
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use namespace_core::tx::{SignedOp, commitment_hash, sighash, sign};
+use namespace_core::tx::{SignedOp, sighash, sign};
 use namespace_core::{Encode, Hash256, Name, NameProof, NameRecord, OwnerKey, Tx};
 use serde_json::Value;
 
@@ -24,7 +23,7 @@ struct Args {
     /// Node RPC address.
     #[arg(long, global = true, default_value = "http://127.0.0.1:7340")]
     node: String,
-    /// Secret key file. Salts for pending registrations are kept next to it.
+    /// Secret key file.
     #[arg(long, global = true)]
     key: Option<PathBuf>,
     #[command(subcommand)]
@@ -44,9 +43,10 @@ enum Cmd {
     /// Fetch a proof of a name's record and check it against the node's
     /// state root.
     Proof { name: Name },
-    /// Step 1 of registering: commit to a name without revealing it.
-    Commit { name: Name },
-    /// Step 2 of registering: reveal a committed name.
+    /// Open a free name for registration a week from now. Anyone can then
+    /// register it; the first registration in a block wins.
+    Announce { name: Name },
+    /// Register an announced name to this wallet's key.
     Register { name: Name },
     /// Extend a name's expiry.
     Renew { name: Name },
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
             None => println!("{name} is not registered"),
         },
         Cmd::Proof { name } => w.proof(name).await?,
-        Cmd::Commit { name } => w.commit(name).await?,
+        Cmd::Announce { name } => w.submit(&Tx::Announce { name }).await?,
         Cmd::Register { name } => w.register(name).await?,
         Cmd::Renew { name } => {
             let kp = w.keypair()?;
@@ -311,64 +311,25 @@ impl Wallet {
         Ok(Keypair::from_secret_key(&Secp256k1::signing_only(), &sk))
     }
 
-    fn salts_path(&self) -> PathBuf {
-        self.key_path.with_extension("salts.json")
-    }
-
-    fn salts(&self) -> Result<BTreeMap<Name, Hash256>> {
-        match std::fs::read_to_string(self.salts_path()) {
-            Ok(s) => Ok(serde_json::from_str(&s)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn save_salts(&self, salts: &BTreeMap<Name, Hash256>) -> Result<()> {
-        write_private(&self.salts_path(), &serde_json::to_string_pretty(salts)?)
-    }
-
-    async fn commit(&self, name: Name) -> Result<()> {
-        let kp = self.keypair()?;
-        let mut salts = self.salts()?;
-        // Reuse the salt if we already committed, so retrying is safe.
-        let salt = *salts.entry(name.clone()).or_insert_with(|| {
-            let mut s = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut s);
-            Hash256(s)
-        });
-        // Save before submitting: losing the salt means losing the commitment.
-        self.save_salts(&salts)?;
-        let commitment = commitment_hash(&name, &owner(&kp), &salt);
-        self.submit(&Tx::Commit { commitment }).await?;
-        println!(
-            "committed to {name}; run `ns register {name}` once the commit is a few blocks deep"
-        );
-        Ok(())
-    }
-
     async fn register(&self, name: Name) -> Result<()> {
         let kp = self.keypair()?;
-        let mut salts = self.salts()?;
-        let salt = *salts.get(&name).with_context(|| {
-            format!("no commitment for {name} in this wallet; run `ns commit {name}`")
-        })?;
-        let commitment = commitment_hash(&name, &owner(&kp), &salt);
-        if self
-            .get(&format!("/commitment/{commitment}"))
+        let announcement = self
+            .get(&format!("/announcement/{name}"))
             .await?
-            .is_none()
-        {
-            bail!("commitment for {name} isn't in the chain yet (or has expired)");
+            .with_context(|| {
+                format!("{name} hasn't been announced; run `ns announce {name}` first")
+            })?;
+        let opens_at = announcement["opens_at"].as_u64().context("bad announcement")?;
+        let status = self.get("/status").await?.context("no status")?;
+        let height = status["height"].as_u64().context("bad status")?;
+        if height + 1 < opens_at {
+            bail!("{name} can be registered from height {opens_at}; the tip is at {height}");
         }
         self.submit(&Tx::Register {
-            name: name.clone(),
+            name,
             owner: owner(&kp),
-            salt,
         })
-        .await?;
-        salts.remove(&name);
-        self.save_salts(&salts)?;
-        Ok(())
+        .await
     }
 
     async fn build(&self) -> Result<Value> {

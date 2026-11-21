@@ -4,17 +4,19 @@ use serde::{Deserialize, Serialize};
 /// Bitcoin heights: a block's validity must not depend on which Bitcoin block
 /// its anchor happens to land in.
 ///
-/// # Registration tiers
+/// # Announcement tiers
 ///
-/// Shorter names are scarcer, so they open later and slowly. A name's *tier*
+/// A name must be announced before it can be registered, and announcements
+/// are rate-limited by tier. Shorter names are scarcer, so they open later and
+/// slowly. A name's *tier*
 /// is how many characters shorter than `long_name_len` it is: names at least
 /// that long are tier 0, one character shorter is tier 1, and so on.
 ///
 /// Every tier follows the same ramp, advancing one stage every
 /// `stage_length` blocks. With `f = ramp_factor` and `k = ramp_slow_stages`,
-/// stage `s` allows `f^(s - k)` registrations per block, capped at
-/// `max_registrations_per_tier`. Below one per block, stage `s` allows one
-/// registration in blocks whose height is a multiple of `f^(k - s)`. With
+/// stage `s` allows `f^(s - k)` announcements per block, capped at
+/// `max_announcements_per_tier`. Below one per block, stage `s` allows one
+/// announcement in blocks whose height is a multiple of `f^(k - s)`. With
 /// the mainnet values (f = 3, k = 2, cap 16) a tier goes through
 ///
 /// ```text
@@ -36,29 +38,23 @@ pub struct Params {
     pub long_name_len: usize,
     /// Blocks per ramp stage.
     pub stage_length: u64,
-    /// Each stage allows this many times more registrations than the last.
+    /// Each stage allows this many times more announcements than the last.
     pub ramp_factor: u32,
-    /// Stages below one registration per block at the start of each tier.
+    /// Stages below one announcement per block at the start of each tier.
     pub ramp_slow_stages: u32,
     /// Where each tier's ramp stops.
-    pub max_registrations_per_tier: u32,
-    /// Commits allowed per block, as a multiple of the registrations allowed
-    /// across all tiers. Commits are free and don't reveal the name, so they
-    /// need their own limit.
-    pub commits_per_registration: u32,
+    pub max_announcements_per_tier: u32,
     /// Hard limit on transactions of any kind per block.
     pub max_txs_per_block: u32,
-    /// A commitment can be revealed this many blocks after it was included at
-    /// the earliest. At least 1, so a reveal seen in the mempool can't be
-    /// front-run by committing to the same name in the same block.
-    pub min_commit_age: u64,
-    /// Commitments older than this can't be revealed anymore and are dropped.
-    pub max_commit_age: u64,
+    /// An announced name can be registered this many blocks after the
+    /// announcement at the earliest. This is the auction: everyone has this
+    /// long to see the name is coming up and bid for the slot that opens it.
+    pub announce_delay: u64,
     /// A name expires this many blocks after it was registered or last renewed.
     pub expiry_period: u64,
 }
 
-/// How many registrations a tier allows at some height.
+/// How many announcements a tier allows at some height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TierRate {
@@ -66,7 +62,7 @@ pub enum TierRate {
     Closed {
         opens_at: u64,
     },
-    /// One registration in blocks whose height is a multiple of `blocks`.
+    /// One announcement in blocks whose height is a multiple of `blocks`.
     Every {
         blocks: u64,
     },
@@ -79,33 +75,32 @@ impl Params {
     pub fn mainnet() -> Self {
         Self {
             long_name_len: 10,
-            // About a month of Bitcoin blocks: a tier takes about six months
-            // to ramp up, and 1-character names open after about four years.
+            // Namespace blocks come every 3 Bitcoin blocks, so this is about
+            // three months: a tier takes about 18 months to ramp up, and
+            // 1-character names open after about 13 years.
             stage_length: 4_380,
             ramp_factor: 3,
             ramp_slow_stages: 2,
-            max_registrations_per_tier: 16,
-            commits_per_registration: 4,
+            max_announcements_per_tier: 16,
             max_txs_per_block: 20_000,
-            min_commit_age: 6,
-            max_commit_age: 1_008,
+            // About a week.
+            announce_delay: 336,
+            // About three years.
             expiry_period: 52_560,
         }
     }
 
     /// Small values for tests and local development. Every name is in the
-    /// first tier, so any name can be registered right away.
+    /// first tier, so any name can be announced right away.
     pub fn regtest() -> Self {
         Self {
             long_name_len: 1,
             stage_length: 10,
             ramp_factor: 3,
             ramp_slow_stages: 2,
-            max_registrations_per_tier: 16,
-            commits_per_registration: 4,
+            max_announcements_per_tier: 16,
             max_txs_per_block: 1_000,
-            min_commit_age: 1,
-            max_commit_age: 20,
+            announce_delay: 2,
             expiry_period: 50,
         }
     }
@@ -130,12 +125,12 @@ impl Params {
         }
     }
 
-    /// Stages from a tier's first registration to its cap.
+    /// Stages from a tier's first announcement to its cap.
     pub fn stages_per_tier(&self) -> u64 {
         let factor = u64::from(self.ramp_factor.max(2));
         let mut fast = 0;
         let mut rate = 1u64;
-        while rate < u64::from(self.max_registrations_per_tier) {
+        while rate < u64::from(self.max_announcements_per_tier) {
             rate = rate.saturating_mul(factor);
             fast += 1;
         }
@@ -172,33 +167,19 @@ impl Params {
             return TierRate::Every { blocks };
         }
         let rate = factor.saturating_pow(u32::try_from(stage - slow).unwrap_or(u32::MAX));
-        let count = rate.min(u64::from(self.max_registrations_per_tier));
+        let count = rate.min(u64::from(self.max_announcements_per_tier));
         TierRate::PerBlock {
             count: u32::try_from(count).unwrap_or(u32::MAX),
         }
     }
 
-    /// Registrations of tier `t` names allowed in the block at `height`.
+    /// Announcements of tier `t` names allowed in the block at `height`.
     pub fn tier_cap(&self, height: u64, tier: u32) -> u32 {
         match self.tier_rate(height, tier) {
             TierRate::Closed { .. } => 0,
             TierRate::Every { blocks } => u32::from(height % blocks.max(1) == 0),
             TierRate::PerBlock { count } => count,
         }
-    }
-
-    /// Commits allowed in the block at `height`. A tier below one
-    /// registration per block counts as one, so its names can still be
-    /// committed to in the blocks between.
-    pub fn commit_cap(&self, height: u64) -> u32 {
-        let per_block: u32 = (0..self.tiers())
-            .map(|t| match self.tier_rate(height, t) {
-                TierRate::Closed { .. } => 0,
-                TierRate::Every { .. } => 1,
-                TierRate::PerBlock { count } => count,
-            })
-            .fold(0, u32::saturating_add);
-        per_block.saturating_mul(self.commits_per_registration)
     }
 }
 
@@ -289,14 +270,6 @@ mod tests {
                 .all(|h| h % 9 == 0)
         );
         assert_eq!(p.tier_cap(opens - 1, 1), 0);
-    }
-
-    #[test]
-    fn commit_cap_counts_slow_tiers_as_one() {
-        let p = params();
-        assert_eq!(p.commit_cap(1), 4 * 3);
-        // Tier 0 at 16, tier 1 at one every 9 blocks.
-        assert_eq!(p.commit_cap(4), 4 * (16 + 1));
     }
 
     #[test]

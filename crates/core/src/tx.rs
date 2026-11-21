@@ -13,16 +13,12 @@ pub type OwnerKey = XOnlyPublicKey;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Tx {
-    /// First half of a registration: publishes `commitment_hash(name, owner, salt)`
-    /// without revealing the name, so it can't be front-run.
-    Commit { commitment: Hash256 },
-    /// Second half of a registration: reveals the name, owner and salt
-    /// behind a commitment that has aged long enough.
-    Register {
-        name: Name,
-        owner: OwnerKey,
-        salt: Hash256,
-    },
+    /// Opens a free name for registration `announce_delay` blocks later.
+    /// Anyone can announce; it doesn't reserve the name for the announcer.
+    Announce { name: Name },
+    /// Registers an announced name once its delay has passed. The first
+    /// registration to land in a block wins.
+    Register { name: Name, owner: OwnerKey },
     /// Extends a name's expiry. Signed by the current owner.
     Renew {
         name: Name,
@@ -38,19 +34,10 @@ pub enum Tx {
     },
 }
 
-const TAG_COMMIT: u8 = 0;
+const TAG_ANNOUNCE: u8 = 0;
 const TAG_REGISTER: u8 = 1;
 const TAG_RENEW: u8 = 2;
 const TAG_TRANSFER: u8 = 3;
-
-/// The hash a `Commit` publishes.
-pub fn commitment_hash(name: &Name, owner: &OwnerKey, salt: &Hash256) -> Hash256 {
-    let mut buf = Vec::new();
-    name.encode(&mut buf);
-    buf.extend_from_slice(&owner.serialize());
-    salt.encode(&mut buf);
-    Hash256::tagged("namespace/commit", &buf)
-}
 
 /// What an owner signs to renew or transfer a name.
 ///
@@ -97,12 +84,12 @@ impl Tx {
         Hash256::tagged("namespace/tx", &self.to_bytes())
     }
 
-    pub fn name(&self) -> Option<&Name> {
+    pub fn name(&self) -> &Name {
         match self {
-            Tx::Commit { .. } => None,
-            Tx::Register { name, .. } | Tx::Renew { name, .. } | Tx::Transfer { name, .. } => {
-                Some(name)
-            }
+            Tx::Announce { name }
+            | Tx::Register { name, .. }
+            | Tx::Renew { name, .. }
+            | Tx::Transfer { name, .. } => name,
         }
     }
 }
@@ -118,15 +105,14 @@ fn decode_sig(r: &mut Reader<'_>) -> Result<schnorr::Signature, DecodeError> {
 impl Encode for Tx {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Tx::Commit { commitment } => {
-                out.push(TAG_COMMIT);
-                commitment.encode(out);
+            Tx::Announce { name } => {
+                out.push(TAG_ANNOUNCE);
+                name.encode(out);
             }
-            Tx::Register { name, owner, salt } => {
+            Tx::Register { name, owner } => {
                 out.push(TAG_REGISTER);
                 name.encode(out);
                 out.extend_from_slice(&owner.serialize());
-                salt.encode(out);
             }
             Tx::Renew { name, seq, sig } => {
                 out.push(TAG_RENEW);
@@ -153,13 +139,12 @@ impl Encode for Tx {
 impl Decode for Tx {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Ok(match r.u8()? {
-            TAG_COMMIT => Tx::Commit {
-                commitment: Hash256::decode(r)?,
+            TAG_ANNOUNCE => Tx::Announce {
+                name: Name::decode(r)?,
             },
             TAG_REGISTER => Tx::Register {
                 name: Name::decode(r)?,
                 owner: decode_key(r)?,
-                salt: Hash256::decode(r)?,
             },
             TAG_RENEW => Tx::Renew {
                 name: Name::decode(r)?,

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeMap;
 
 use bitcoin::secp256k1::{Secp256k1, VerifyOnly};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use crate::hash::Hash256;
 use crate::name::Name;
 use crate::params::Params;
 use crate::tree::{InvalidProof, Proof, Tree};
-use crate::tx::{OwnerKey, SignedOp, Tx, commitment_hash, sighash, verify};
+use crate::tx::{OwnerKey, SignedOp, Tx, sighash, verify};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameRecord {
@@ -50,8 +50,8 @@ impl Decode for NameRecord {
     }
 }
 
-// Where names and commitments live in the state tree. Distinct tags keep the
-// two kinds of key apart.
+// Where names and announcements live in the state tree. Distinct tags keep
+// the two kinds of key apart.
 
 fn name_key(name: &Name) -> Hash256 {
     Hash256::tagged("namespace/state-name", &name.to_bytes())
@@ -61,12 +61,12 @@ fn name_value(record: &NameRecord) -> Hash256 {
     Hash256::tagged("namespace/state-name-record", &record.to_bytes())
 }
 
-fn commitment_key(commitment: &Hash256) -> Hash256 {
-    Hash256::tagged("namespace/state-commitment", &commitment.0)
+fn announcement_key(name: &Name) -> Hash256 {
+    Hash256::tagged("namespace/state-announcement", &name.to_bytes())
 }
 
-fn commitment_value(height: u64) -> Hash256 {
-    Hash256::tagged("namespace/state-commitment-height", &height.to_le_bytes())
+fn announcement_value(height: u64) -> Hash256 {
+    Hash256::tagged("namespace/state-announcement-height", &height.to_le_bytes())
 }
 
 /// Proves a name's record (or that it has none) against a header's
@@ -111,7 +111,7 @@ pub enum BlockError {
         count: u32,
         cap: u32,
     },
-    #[error("too many registrations of {lengths}-character names: {count} > {cap}")]
+    #[error("too many announcements of {lengths}-character names: {count} > {cap}")]
     TierLimit {
         lengths: String,
         count: u32,
@@ -123,12 +123,12 @@ pub enum BlockError {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TxError {
-    #[error("commitment already exists")]
-    DuplicateCommitment,
-    #[error("no matching commitment")]
-    NoCommitment,
-    #[error("commitment is too recent; reveal at height {0} or later")]
-    CommitmentTooRecent(u64),
+    #[error("name has already been announced")]
+    AlreadyAnnounced,
+    #[error("name has not been announced")]
+    NotAnnounced,
+    #[error("name can't be registered until height {0}")]
+    AnnouncementTooRecent(u64),
     #[error("name is already registered")]
     NameTaken,
     #[error("name is not registered or has expired")]
@@ -140,15 +140,14 @@ pub enum TxError {
 }
 
 /// The state after applying a chain of blocks: every name's record plus the
-/// commitments waiting to be revealed.
+/// announced names waiting to be registered.
 #[derive(Clone, Debug)]
 pub struct State {
     tip: BlockHash,
     height: u64,
     names: BTreeMap<Name, NameRecord>,
-    commitments: HashMap<Hash256, u64>,
-    /// `(height, commitment)` for pruning commitments in height order.
-    commitments_by_height: BTreeSet<(u64, Hash256)>,
+    /// Announced names and the height they were announced at.
+    announcements: BTreeMap<Name, u64>,
     /// Both of the above, authenticated. Its root is the header's `state_root`.
     tree: Tree,
 }
@@ -164,8 +163,8 @@ pub struct Undo {
 #[derive(Clone, Debug)]
 enum UndoEntry {
     Name(Name, Option<NameRecord>),
-    CommitmentAdded(Hash256, u64),
-    CommitmentRemoved(Hash256, u64),
+    AnnouncementAdded(Name),
+    AnnouncementRemoved(Name, u64),
 }
 
 impl Default for State {
@@ -181,8 +180,7 @@ impl State {
             tip: Block::genesis().hash(),
             height: 0,
             names: BTreeMap::new(),
-            commitments: HashMap::new(),
-            commitments_by_height: BTreeSet::new(),
+            announcements: BTreeMap::new(),
             tree: Tree::new(),
         }
     }
@@ -200,8 +198,9 @@ impl State {
         self.names.get(name).filter(|r| r.is_active(self.height))
     }
 
-    pub fn commitment_height(&self, commitment: &Hash256) -> Option<u64> {
-        self.commitments.get(commitment).copied()
+    /// The height `name` was announced at, if it is waiting to be registered.
+    pub fn announced_at(&self, name: &Name) -> Option<u64> {
+        self.announcements.get(name).copied()
     }
 
     /// The root a block leaving this state must carry.
@@ -232,7 +231,6 @@ impl State {
         };
         next.height += 1;
         let height = next.height;
-        next.prune_commitments(height, params, &mut undo);
         for (index, tx) in txs.iter().enumerate() {
             next.apply_tx(tx, height, params, secp, &mut undo)
                 .map_err(|error| BlockError::Tx { index, error })?;
@@ -273,7 +271,6 @@ impl State {
         };
         self.tip = block.hash();
         self.height = height;
-        self.prune_commitments(height, params, &mut undo);
 
         for (index, tx) in block.txs.iter().enumerate() {
             if let Err(error) = self.apply_tx(tx, height, params, secp, &mut undo) {
@@ -296,8 +293,8 @@ impl State {
                 UndoEntry::Name(name, prev) => {
                     self.put_name(&name, prev);
                 }
-                UndoEntry::CommitmentAdded(c, at) => self.remove_commitment(c, at),
-                UndoEntry::CommitmentRemoved(c, at) => self.insert_commitment(c, at),
+                UndoEntry::AnnouncementAdded(name) => self.remove_announcement(&name),
+                UndoEntry::AnnouncementRemoved(name, at) => self.insert_announcement(&name, at),
             }
         }
         self.tip = undo.prev_tip;
@@ -318,41 +315,22 @@ impl State {
         };
         let height = self.height + 1;
         self.height = height;
-        self.prune_commitments(height, params, &mut undo);
         let result = self.apply_tx(tx, height, params, secp, &mut undo);
         self.revert(undo);
         result
     }
 
-    fn prune_commitments(&mut self, height: u64, params: &Params, undo: &mut Undo) {
-        // A commitment made at `at` can be revealed up to `at + max_commit_age`.
-        let Some(cutoff) = height.checked_sub(params.max_commit_age) else {
-            return;
-        };
-        let expired: Vec<_> = self
-            .commitments_by_height
-            .range(..(cutoff, Hash256::ZERO))
-            .copied()
-            .collect();
-        for (at, c) in expired {
-            self.remove_commitment(c, at);
-            undo.entries.push(UndoEntry::CommitmentRemoved(c, at));
-        }
-    }
-
-    // The only places that change names and commitments, so the tree always
+    // The only places that change names and announcements, so the tree always
     // matches them.
 
-    fn insert_commitment(&mut self, c: Hash256, at: u64) {
-        self.commitments.insert(c, at);
-        self.commitments_by_height.insert((at, c));
-        self.tree.insert(commitment_key(&c), commitment_value(at));
+    fn insert_announcement(&mut self, name: &Name, at: u64) {
+        self.announcements.insert(name.clone(), at);
+        self.tree.insert(announcement_key(name), announcement_value(at));
     }
 
-    fn remove_commitment(&mut self, c: Hash256, at: u64) {
-        self.commitments.remove(&c);
-        self.commitments_by_height.remove(&(at, c));
-        self.tree.remove(&commitment_key(&c));
+    fn remove_announcement(&mut self, name: &Name) {
+        self.announcements.remove(name);
+        self.tree.remove(&announcement_key(name));
     }
 
     /// Sets or clears a name's record, returning the previous one.
@@ -383,30 +361,31 @@ impl State {
         undo: &mut Undo,
     ) -> Result<(), TxError> {
         match tx {
-            Tx::Commit { commitment } => {
-                if self.commitments.contains_key(commitment) {
-                    return Err(TxError::DuplicateCommitment);
-                }
-                self.insert_commitment(*commitment, height);
-                undo.entries
-                    .push(UndoEntry::CommitmentAdded(*commitment, height));
-            }
-            Tx::Register { name, owner, salt } => {
-                let commitment = commitment_hash(name, owner, salt);
-                let at = self
-                    .commitments
-                    .get(&commitment)
-                    .copied()
-                    .ok_or(TxError::NoCommitment)?;
-                if height < at + params.min_commit_age {
-                    return Err(TxError::CommitmentTooRecent(at + params.min_commit_age));
-                }
+            Tx::Announce { name } => {
                 if self.names.get(name).is_some_and(|r| r.is_active(height)) {
                     return Err(TxError::NameTaken);
                 }
-                self.remove_commitment(commitment, at);
+                if self.announcements.contains_key(name) {
+                    return Err(TxError::AlreadyAnnounced);
+                }
+                self.insert_announcement(name, height);
+                undo.entries.push(UndoEntry::AnnouncementAdded(name.clone()));
+            }
+            Tx::Register { name, owner } => {
+                // An announced name has no active record: announcing requires
+                // that, and registering removes the announcement.
+                let at = self
+                    .announcements
+                    .get(name)
+                    .copied()
+                    .ok_or(TxError::NotAnnounced)?;
+                let opens_at = at + params.announce_delay;
+                if height < opens_at {
+                    return Err(TxError::AnnouncementTooRecent(opens_at));
+                }
+                self.remove_announcement(name);
                 undo.entries
-                    .push(UndoEntry::CommitmentRemoved(commitment, at));
+                    .push(UndoEntry::AnnouncementRemoved(name.clone(), at));
                 let record = NameRecord {
                     owner: *owner,
                     registered_at: height,
@@ -475,9 +454,8 @@ pub struct BlockBuilder<'a> {
     secp: &'a Secp256k1<VerifyOnly>,
     undo: Undo,
     txs: Vec<Tx>,
-    /// Registrations so far, by tier.
-    registrations: BTreeMap<u32, u32>,
-    commits: u32,
+    /// Announcements so far, by tier.
+    announcements: BTreeMap<u32, u32>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -491,44 +469,36 @@ pub enum AddTxError {
 impl<'a> BlockBuilder<'a> {
     pub fn new(state: &State, params: &'a Params, secp: &'a Secp256k1<VerifyOnly>) -> Self {
         let mut state = state.clone();
-        let mut undo = Undo {
+        let undo = Undo {
             prev_tip: state.tip,
             entries: Vec::new(),
         };
         state.height += 1;
-        let height = state.height;
-        state.prune_commitments(height, params, &mut undo);
         Self {
             state,
             params,
             secp,
             undo,
             txs: Vec::new(),
-            registrations: BTreeMap::new(),
-            commits: 0,
+            announcements: BTreeMap::new(),
         }
     }
 
     pub fn try_add(&mut self, tx: Tx) -> Result<(), AddTxError> {
         let height = self.state.height;
-        let tier = tx.name().map(|n| self.params.tier(n.as_str().len()));
-        let full = match (&tx, tier) {
-            _ if self.txs.len() as u32 >= self.params.max_txs_per_block => true,
-            (Tx::Register { .. }, Some(t)) => {
-                self.registrations.get(&t).copied().unwrap_or(0) >= self.params.tier_cap(height, t)
-            }
-            (Tx::Commit { .. }, _) => self.commits >= self.params.commit_cap(height),
-            _ => false,
-        };
+        let tier = self.params.tier(tx.name().as_str().len());
+        let announce = matches!(tx, Tx::Announce { .. });
+        let full = self.txs.len() as u32 >= self.params.max_txs_per_block
+            || announce
+                && self.announcements.get(&tier).copied().unwrap_or(0)
+                    >= self.params.tier_cap(height, tier);
         if full {
             return Err(AddTxError::Full);
         }
         self.state
             .apply_tx(&tx, height, self.params, self.secp, &mut self.undo)?;
-        match (&tx, tier) {
-            (Tx::Register { .. }, Some(t)) => *self.registrations.entry(t).or_default() += 1,
-            (Tx::Commit { .. }, _) => self.commits += 1,
-            _ => {}
+        if announce {
+            *self.announcements.entry(tier).or_default() += 1;
         }
         self.txs.push(tx);
         Ok(())
@@ -557,10 +527,10 @@ impl Encode for State {
         }
         put_u32(
             out,
-            u32::try_from(self.commitments_by_height.len()).expect("commitment count fits in u32"),
+            u32::try_from(self.announcements.len()).expect("announcement count fits in u32"),
         );
-        for (at, c) in &self.commitments_by_height {
-            c.encode(out);
+        for (name, at) in &self.announcements {
+            name.encode(out);
             put_u64(out, *at);
         }
     }
@@ -581,39 +551,30 @@ impl Decode for State {
             }
         }
         for _ in 0..r.u32()? {
-            let c = Hash256::decode(r)?;
+            let name = Name::decode(r)?;
             let at = r.u64()?;
-            if state.commitments.contains_key(&c) {
-                return Err(DecodeError::Invalid("duplicate commitment"));
+            if state.announcements.contains_key(&name) {
+                return Err(DecodeError::Invalid("duplicate announcement"));
             }
-            state.insert_commitment(c, at);
+            state.insert_announcement(&name, at);
         }
         Ok(state)
     }
 }
 
 fn check_limits(block: &Block, params: &Params, height: u64) -> Result<(), BlockError> {
-    let count = |pred: fn(&Tx) -> bool| block.txs.iter().filter(|t| pred(t)).count() as u32;
-    let checks = [
-        (
-            "transaction",
-            block.txs.len() as u32,
-            params.max_txs_per_block,
-        ),
-        (
-            "commit",
-            count(|t| matches!(t, Tx::Commit { .. })),
-            params.commit_cap(height),
-        ),
-    ];
-    for (kind, count, cap) in checks {
-        if count > cap {
-            return Err(BlockError::Limit { kind, count, cap });
-        }
+    let count = block.txs.len() as u32;
+    let cap = params.max_txs_per_block;
+    if count > cap {
+        return Err(BlockError::Limit {
+            kind: "transaction",
+            count,
+            cap,
+        });
     }
     let mut by_tier = BTreeMap::<u32, u32>::new();
     for tx in &block.txs {
-        if let Tx::Register { name, .. } = tx {
+        if let Tx::Announce { name } = tx {
             *by_tier.entry(params.tier(name.as_str().len())).or_default() += 1;
         }
     }

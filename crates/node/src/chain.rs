@@ -251,13 +251,13 @@ impl Chain {
         if self.mempool.len() >= MAX_MEMPOOL_TXS {
             return Err("mempool is full".into());
         }
-        if let Tx::Register { name, .. } = &tx {
+        if let Tx::Announce { name } = &tx {
             let tier = self.params.tier(name.as_str().len());
             if let TierRate::Closed { opens_at } =
                 self.params.tier_rate(self.state.height() + 1, tier)
             {
                 return Err(format!(
-                    "{}-character names can't be registered until height {opens_at}",
+                    "{}-character names can't be announced until height {opens_at}",
                     self.params.tier_lengths(tier)
                 ));
             }
@@ -346,7 +346,8 @@ impl Chain {
         }
         if self.state.tip() != before {
             info!(height = self.state.height(), tip = %self.state.tip(), "new tip");
-            // Oldest disconnected block first, so commits come before reveals.
+            // Oldest disconnected block first, so announcements come before
+            // registrations.
             let resurrected = disconnected.into_iter().rev().flatten();
             let pending = std::mem::take(&mut self.mempool);
             self.refill_mempool(resurrected.chain(pending));
@@ -373,7 +374,6 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::{Keypair, SecretKey};
     use namespace_core::Encode;
-    use namespace_core::tx::commitment_hash;
     use namespace_core::{Anchor, Name};
 
     use super::*;
@@ -463,14 +463,12 @@ mod tests {
         }
     }
 
+    /// Announcing `name` and then registering it to `kp`.
     fn register_txs(name: &str, kp: &Keypair) -> (Tx, Tx) {
         let name = Name::new(name).unwrap();
         let owner = kp.x_only_public_key().0;
-        let salt = Hash256([5; 32]);
-        let commit = Tx::Commit {
-            commitment: commitment_hash(&name, &owner, &salt),
-        };
-        (commit, Tx::Register { name, owner, salt })
+        let announce = Tx::Announce { name: name.clone() };
+        (announce, Tx::Register { name, owner })
     }
 
     fn keypair() -> Keypair {
@@ -483,19 +481,22 @@ mod tests {
     #[test]
     fn build_anchor_register() {
         let mut f = Fixture::new("register");
-        let (commit, register) = register_txs("alice", &keypair());
+        let (announce, register) = register_txs("alice", &keypair());
 
-        // Reveal before the commit is in the chain is refused by the mempool.
+        // Registering before the announcement is in the chain, or before its
+        // delay is up, is refused by the mempool.
         assert!(f.chain.submit_tx(register.clone()).is_err());
-        f.chain.submit_tx(commit).unwrap();
+        f.chain.submit_tx(announce).unwrap();
         f.build_and_mine();
         assert_eq!(f.chain.state().height(), 1);
         assert_eq!(f.chain.mempool_len(), 0);
+        assert!(f.chain.submit_tx(register.clone()).is_err());
 
-        f.chain.submit_tx(register).unwrap();
         f.mine(None);
         f.build_and_mine();
-        assert_eq!(f.chain.state().height(), 2);
+        f.chain.submit_tx(register).unwrap();
+        f.build_and_mine();
+        assert_eq!(f.chain.state().height(), 3);
         assert!(
             f.chain
                 .state()
@@ -521,9 +522,8 @@ mod tests {
         let a = f.build_and_mine();
 
         // Someone anchors a block but never publishes it.
-        let withheld = f.next_block(vec![Tx::Commit {
-            commitment: Hash256([9; 32]),
-        }]);
+        let (announce, _) = register_txs("alice", &keypair());
+        let withheld = f.next_block(vec![announce]);
         f.mine(Some(&withheld));
         assert_eq!(f.chain.missing_bodies(), vec![withheld.hash()]);
         assert_eq!(f.chain.state().tip(), a.hash());
@@ -546,8 +546,8 @@ mod tests {
     #[test]
     fn late_body_is_applied() {
         let mut f = Fixture::new("late");
-        let (commit, _) = register_txs("alice", &keypair());
-        let block = f.next_block(vec![commit]);
+        let (announce, _) = register_txs("alice", &keypair());
+        let block = f.next_block(vec![announce]);
         f.mine(Some(&block));
         assert_eq!(f.chain.state().height(), 0);
         assert_eq!(
@@ -561,7 +561,7 @@ mod tests {
     fn invalid_anchored_block_is_skipped() {
         let mut f = Fixture::new("invalid");
         let (_, register) = register_txs("alice", &keypair());
-        // Registers without a commitment: anchored, but invalid.
+        // Registers without an announcement: anchored, but invalid.
         let bad = Block::new(Block::genesis().hash(), 0, vec![register], Hash256::ZERO);
         f.mine(Some(&bad));
         assert_eq!(f.chain.add_block(&f.store, bad).unwrap(), AddBlock::Stored);
@@ -574,15 +574,15 @@ mod tests {
     fn bitcoin_reorg_unwinds_namespace_blocks() {
         let mut f = Fixture::new("btc-reorg");
         let a = f.build_and_mine();
-        let (commit, _) = register_txs("alice", &keypair());
-        f.chain.submit_tx(commit).unwrap();
+        let (announce, _) = register_txs("alice", &keypair());
+        f.chain.submit_tx(announce).unwrap();
         f.build_and_mine();
         assert_eq!(f.chain.state().height(), 2);
 
         f.chain.rollback_scans(&f.store, 2).unwrap();
         f.btc_height = 1;
         assert_eq!(f.chain.state().tip(), a.hash());
-        // The commit is back in the mempool.
+        // The announcement is back in the mempool.
         assert_eq!(f.chain.mempool_len(), 1);
         assert_eq!(f.chain.next_scan_height(), 2);
     }
@@ -594,9 +594,7 @@ mod tests {
         let stale = Block::new(
             Block::genesis().hash(),
             0,
-            vec![Tx::Commit {
-                commitment: Hash256([1; 32]),
-            }],
+            vec![register_txs("alice", &keypair()).0],
             Hash256::ZERO,
         );
         assert!(matches!(
@@ -618,8 +616,9 @@ mod tests {
     #[test]
     fn restart_resumes_from_snapshot() {
         let mut f = Fixture::new("snapshot");
-        let (commit, register) = register_txs("alice", &keypair());
-        f.chain.submit_tx(commit).unwrap();
+        let (announce, register) = register_txs("alice", &keypair());
+        f.chain.submit_tx(announce).unwrap();
+        f.build_and_mine();
         f.build_and_mine();
         f.chain.submit_tx(register).unwrap();
         f.build_and_mine();
@@ -629,10 +628,10 @@ mod tests {
 
         f.reload();
         assert_eq!(f.chain.state().tip(), tip);
-        assert_eq!(f.chain.state().height(), 3);
-        // Blocks 1-2 came from the snapshot, block 3 was replayed.
+        assert_eq!(f.chain.state().height(), 4);
+        // Blocks 1-3 came from the snapshot, block 4 was replayed.
         let undos: Vec<_> = f.chain.active.iter().map(|(_, u)| u.is_some()).collect();
-        assert_eq!(undos, vec![false, false, true]);
+        assert_eq!(undos, vec![false, false, false, true]);
         assert!(
             f.chain
                 .state()
@@ -645,8 +644,8 @@ mod tests {
     fn tampered_snapshot_is_ignored() {
         let mut f = Fixture::new("bad-snapshot");
         f.build_and_mine();
-        let (commit, _) = register_txs("alice", &keypair());
-        f.chain.submit_tx(commit).unwrap();
+        let (announce, _) = register_txs("alice", &keypair());
+        f.chain.submit_tx(announce).unwrap();
         f.build_and_mine();
         // A snapshot claiming block 2's tip, but with block 1's contents.
         let mut wrong = f.chain.state().clone();
@@ -669,8 +668,8 @@ mod tests {
     fn reorg_below_snapshot_replays_from_genesis() {
         let mut f = Fixture::new("snapshot-reorg");
         let a = f.build_and_mine();
-        let (commit, _) = register_txs("alice", &keypair());
-        f.chain.submit_tx(commit).unwrap();
+        let (announce, _) = register_txs("alice", &keypair());
+        f.chain.submit_tx(announce).unwrap();
         f.build_and_mine();
         f.chain.save_snapshot(&f.store).unwrap();
         f.reload();
